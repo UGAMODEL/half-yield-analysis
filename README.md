@@ -72,12 +72,12 @@ uv run main.py --source video.mp4 --model halfyield-model.pt --show --show-chart
 Run on sample video, saving annotated output:
 
 ```bash
-uv run main.py \\
-  --source video.mp4 \\
-  --model halfyield-model.pt \\
-  --save annotated.mp4 \\
-  --show \\
-  --show-chart \\
+uv run main.py \
+  --source video.mp4 \
+  --model halfyield-model.pt \
+  --save annotated.mp4 \
+  --show \
+  --show-chart \
   --half-conf 0.35 --piece-conf 0.30
 ```
 
@@ -94,3 +94,4 @@ halfyield-runner/
 ├── uv.lock             # Frozen dependency lockfile
 └── README.md           # This file
 ```
+
