@@ -692,16 +692,17 @@ class DedicatedGPUPipeline:
     - GPU 1: YOLO inference
     """
     
-    def __init__(self, model_path, class_config, args, batch_size=128):
+    def __init__(self, model_path, class_config, args, batch_size=512):  # Much larger for P40s
         self.model_path = model_path
         self.class_config = class_config
         self.args = args
+        # P40s have 24GB each - we can be aggressive with batching
         self.batch_size = batch_size  # This is the max batch size for streaming
         self.debug = args.debug  # Store debug flag
         
-        # Optimized queues for high throughput
-        self.preprocessed_queue = queue.Queue(maxsize=30)  # Larger queue for better buffering
-        self.result_queue = queue.Queue(maxsize=300)       # Larger result buffer
+        # Optimized queues for P40 high throughput - much larger buffers
+        self.preprocessed_queue = queue.Queue(maxsize=100)  # Larger queue for P40 throughput
+        self.result_queue = queue.Queue(maxsize=1000)       # Much larger result buffer for P40s
         self.stop_event = threading.Event()
         
         # Workers
@@ -712,9 +713,10 @@ class DedicatedGPUPipeline:
         self.decode_gpu = 0      # GPU 0: Decode + preprocess
         self.inference_gpu = 1   # GPU 1: Pure inference
         
-        print("Dedicated GPU Pipeline (High-Throughput Streaming Mode):")
+        print("Dedicated GPU Pipeline (P40-Optimized High-Performance Mode):")
         print(f"  GPU {self.decode_gpu}: NVDEC decode + preprocessing")
-        print(f"  GPU {self.inference_gpu}: YOLO inference (streaming batches, max size: {batch_size})")
+        print(f"  GPU {self.inference_gpu}: YOLO inference (P40-optimized batches, max size: {batch_size})")
+        print(f"  P40 Configuration: Large batches ({batch_size}), extended queues, optimized memory management")
         
     def start_workers(self, video_capture):
         """Start the dedicated GPU workers."""
@@ -771,10 +773,10 @@ class DedicatedGPUPipeline:
             batch_metadata = []
             batch_count = 0
             
-            # Streaming batch parameters - optimized for continuous throughput
-            min_batch_size = 32    # Smaller minimum for faster sending
-            max_batch_size = 128   # Smaller max to reduce assembly time
-            send_timeout_frames = 16  # Send more frequently
+            # Streaming batch parameters - optimized for P40 throughput
+            min_batch_size = 128   # Larger batches for P40 efficiency
+            max_batch_size = 512   # Much larger max to utilize P40 memory
+            send_timeout_frames = 64  # Allow larger batch assembly for P40s
             frames_since_send = 0
             
             # Pre-allocate batch storage
@@ -799,12 +801,12 @@ class DedicatedGPUPipeline:
                     frame_id += 1
                     frames_since_send += 1
                     
-                    # Optimized streaming batch logic - send more aggressively
+                    # P40-optimized batch logic - favor larger batches for efficiency
                     should_send = (
                         len(batch_frames) >= max_batch_size or  # Hit max batch size
                         (len(batch_frames) >= min_batch_size and frames_since_send >= send_timeout_frames) or  # Good size + timeout
-                        (frames_since_send >= send_timeout_frames and len(batch_frames) > 0) or  # Force send with any frames
-                        (len(batch_frames) >= 16 and frames_since_send >= 8)  # Quick send for small batches
+                        (frames_since_send >= send_timeout_frames * 2 and len(batch_frames) > 0) or  # Longer timeout for P40s
+                        (len(batch_frames) >= 256 and frames_since_send >= 32)  # Large batch quick send
                     )
                     
                     if should_send:
@@ -818,8 +820,8 @@ class DedicatedGPUPipeline:
                             print(f"GPU {self.decode_gpu} attempting to send batch {batch_count} with {len(batch_frames)} frames (queue size: {self.preprocessed_queue.qsize()})")
                         
                         try:
-                            # Use short timeout instead of non-blocking to reduce drops
-                            self.preprocessed_queue.put(batch_data, timeout=0.05)
+                            # Use longer timeout for P40s to avoid dropping large batches
+                            self.preprocessed_queue.put(batch_data, timeout=0.5)
                             if self.debug and batch_count % 10 == 0:  # Only print in debug mode
                                 print(f"GPU {self.decode_gpu} → batch {batch_count} ({len(batch_frames)} frames) → GPU {self.inference_gpu} SUCCESS")
                             batch_frames = []
@@ -861,13 +863,33 @@ class DedicatedGPUPipeline:
             import torch
             from ultralytics import YOLO
             
-            # Load model on inference GPU
+            # Load model on inference GPU with P40 optimizations
             if torch.cuda.is_available():
                 torch.cuda.set_device(self.inference_gpu)
+                # P40 memory optimization
+                torch.backends.cudnn.benchmark = True  # Optimize for consistent input sizes
+                torch.backends.cuda.matmul.allow_tf32 = True  # Allow TF32 for speed
             model = YOLO(self.model_path)
             model.to(f"cuda:{self.inference_gpu}")
+            # Enable model optimizations for P40
+            if hasattr(model.model, 'fuse'):
+                model.model.fuse()  # Fuse conv/bn layers for speed
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+            
+            # P40 warmup for optimal performance
+            if self.debug:
+                print(f"GPU {self.inference_gpu} performing P40 warmup...")
+            try:
+                # Warmup with a representative batch size
+                warmup_batch = [np.random.randint(0, 255, (MODEL_SIZE, MODEL_SIZE, 3), dtype=np.uint8) for _ in range(64)]
+                _ = model.predict(warmup_batch, imgsz=MODEL_SIZE, verbose=False, conf=0.5, device=f"cuda:{self.inference_gpu}", half=True)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize(self.inference_gpu)
+                if self.debug:
+                    print(f"GPU {self.inference_gpu} warmup completed")
+            except Exception:
+                pass  # Warmup failed, but continue
             
             print(f"GPU {self.inference_gpu} inference worker ready")
             
@@ -879,8 +901,8 @@ class DedicatedGPUPipeline:
                     if self.debug and batch_count % 10 == 0:  # Reduce debug frequency
                         print(f"GPU {self.inference_gpu} waiting for batch data...")
                     
-                    # Get preprocessed batch from GPU 0
-                    batch_data = self.preprocessed_queue.get(timeout=2.0)
+                    # Get preprocessed batch from GPU 0 - longer timeout for P40 large batches
+                    batch_data = self.preprocessed_queue.get(timeout=5.0)
                     if batch_data is None:  # Sentinel
                         print(f"GPU {self.inference_gpu} received sentinel, exiting")
                         break
@@ -912,7 +934,7 @@ class DedicatedGPUPipeline:
                         if self.debug and batch_count % 50 == 0:
                             print(f"GPU {self.inference_gpu} starting model.predict() for batch {batch_id}")
                         
-                        # Use batch_frames directly - they are already preprocessed images
+                        # P40-optimized inference with larger batches
                         # YOLO expects a list of numpy arrays (H, W, C) format
                         results_generator = model.predict(
                             batch_frames,  # Pass list of preprocessed images directly
@@ -920,10 +942,11 @@ class DedicatedGPUPipeline:
                             verbose=False,  # Disable verbose for production
                             conf=self.args.conf,
                             device=f"cuda:{self.inference_gpu}",
-                            half=True,
+                            half=True,     # FP16 for P40 speed
                             augment=False,
                             stream=True,   # Use stream=True to prevent memory accumulation warnings
                             save=False,    # Don't save predictions
+                            max_det=300,   # Increase detection limit for P40s
                         )
                         
                         if self.debug and batch_count % 50 == 0:
@@ -951,7 +974,7 @@ class DedicatedGPUPipeline:
                             
                             result_data = (frame_id, processed_frame, half_area, piece_area, pos_ms)
                             try:
-                                self.result_queue.put(result_data, timeout=0.1)
+                                self.result_queue.put(result_data, timeout=1.0)  # Longer timeout for P40 large batches
                                 results_sent += 1
                             except queue.Full:
                                 if self.debug and batch_count % 20 == 0:
