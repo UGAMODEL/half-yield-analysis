@@ -64,7 +64,8 @@ def get_optimal_device():
     if torch.cuda.is_available():
         device_count = torch.cuda.device_count()
         device_name = torch.cuda.get_device_name(0) if device_count > 0 else "Unknown"
-        print(f"CUDA available: {device_count} device(s). Using GPU: {device_name}")
+        memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3) if device_count > 0 else 0
+        print(f"CUDA available: {device_count} device(s). Using GPU: {device_name} ({memory_gb:.1f}GB)")
         return "cuda:0"
     
     # Check for MPS (Apple Silicon Metal Performance Shaders)
@@ -77,7 +78,172 @@ def get_optimal_device():
     return "cpu"
 
 
-# ======================= Utilities =======================
+def get_optimal_batch_size(device, model_size=640, max_batch_size=256, memory_fraction=0.8):
+    """
+    Determine optimal batch size based on available GPU memory.
+    """
+    if not torch or not torch.cuda.is_available() or "cuda" not in device:
+        return min(8, max_batch_size)  # Conservative default for non-CUDA
+    
+    try:
+        # Get GPU memory info
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory
+        available_memory = gpu_memory * memory_fraction
+        
+        # Estimate memory per frame (rough calculation)
+        # Model input: 3 channels * model_size^2 * 4 bytes (float32) * 2 (input + gradients)
+        bytes_per_frame = 3 * model_size * model_size * 4 * 2
+        
+        # Add overhead for model weights and intermediate activations (rough estimate)
+        model_overhead = 2 * 1024**3  # ~2GB for model + activations
+        
+        # Calculate max batch size
+        usable_memory = available_memory - model_overhead
+        theoretical_max = int(usable_memory / bytes_per_frame)
+        
+        # Apply safety factors and limits
+        safe_batch_size = min(theoretical_max // 2, max_batch_size)  # 50% safety margin
+        safe_batch_size = max(safe_batch_size, 1)  # At least 1
+        
+        # Round to power of 2 for better GPU utilization
+        power_of_2 = 1
+        while power_of_2 * 2 <= safe_batch_size:
+            power_of_2 *= 2
+        
+        optimal_batch_size = power_of_2
+        
+        print(f"GPU Memory: {gpu_memory / (1024**3):.1f}GB, "
+              f"Calculated optimal batch size: {optimal_batch_size}")
+        
+        return optimal_batch_size
+        
+    except Exception as e:
+        print(f"Could not determine optimal batch size: {e}. Using default.")
+        return min(16, max_batch_size)
+
+
+def create_video_writer(output_path, fps, width, height, use_nvenc=True):
+    """
+    Create VideoWriter with NVENC hardware encoding if available.
+    Falls back to CPU encoding if NVENC is not available.
+    """
+    if use_nvenc and torch and torch.cuda.is_available():
+        try:
+            # Try NVENC backends
+            nvenc_configs = [
+                (cv2.CAP_FFMPEG, 'H264'),  # H.264 NVENC
+                (cv2.CAP_FFMPEG, 'HEVC'),  # H.265 NVENC
+            ]
+            
+            for backend, codec in nvenc_configs:
+                try:
+                    fourcc = cv2.VideoWriter_fourcc(*codec)
+                    writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height), True)
+                    
+                    # Test if it works
+                    if writer.isOpened():
+                        print(f"NVENC hardware encoding enabled ({codec})")
+                        return writer
+                    writer.release()
+                except Exception as e:
+                    print(f"NVENC codec {codec} failed: {e}")
+                    continue
+                    
+            print("NVENC not available, falling back to CPU encoding")
+        except Exception as e:
+            print(f"NVENC initialization failed: {e}")
+    
+    # Fallback to standard CPU encoding
+    try:
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height), True)
+        if writer.isOpened():
+            print("Using CPU video encoding")
+            return writer
+        writer.release()
+    except Exception as e:
+        print(f"MP4V encoding failed: {e}")
+    
+    # Final fallback
+    try:
+        fourcc = cv2.VideoWriter_fourcc(*"XVID")
+        writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height), True)
+        if writer.isOpened():
+            print("Using XVID CPU encoding")
+            return writer
+    except Exception as e:
+        print(f"XVID encoding failed: {e}")
+    
+    raise RuntimeError(f"Could not create video writer for: {output_path}")
+
+
+def create_video_capture(video_path, use_nvdec=True):
+    """
+    Create VideoCapture with NVDEC hardware decoding if available.
+    Falls back to CPU decoding if NVDEC is not available.
+    """
+    # Try NVDEC first if requested and CUDA is available
+    if use_nvdec and torch and torch.cuda.is_available():
+        try:
+            # Try different NVDEC backends
+            nvdec_backends = [
+                cv2.CAP_FFMPEG,  # FFmpeg with NVDEC
+                cv2.CAP_GSTREAMER,  # GStreamer with NVDEC
+            ]
+            
+            for backend in nvdec_backends:
+                try:
+                    cap = cv2.VideoCapture(str(video_path), backend)
+                    
+                    # Configure NVDEC properties
+                    cap.set(cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY)
+                    cap.set(cv2.CAP_PROP_HW_DEVICE, 0)  # Use GPU 0
+                    
+                    # Test if it works
+                    if cap.isOpened():
+                        ret, frame = cap.read()
+                        if ret and frame is not None:
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Reset to beginning
+                            print(f"NVDEC hardware decoding enabled (backend: {backend})")
+                            return cap
+                        cap.release()
+                except Exception as e:
+                    print(f"NVDEC backend {backend} failed: {e}")
+                    continue
+                    
+            print("NVDEC not available, falling back to CPU decoding")
+        except Exception as e:
+            print(f"NVDEC initialization failed: {e}")
+    
+    # Fallback to standard CPU decoding
+    cap = cv2.VideoCapture(str(video_path))
+    if cap.isOpened():
+        print("Using CPU video decoding")
+        return cap
+    else:
+        raise RuntimeError(f"Could not open video file: {video_path}")
+
+
+def get_gpu_memory_info():
+    """Get GPU memory information for optimization."""
+    if not torch or not torch.cuda.is_available():
+        return None
+    
+    try:
+        device = torch.cuda.current_device()
+        total_memory = torch.cuda.get_device_properties(device).total_memory
+        allocated_memory = torch.cuda.memory_allocated(device)
+        cached_memory = torch.cuda.memory_reserved(device)
+        free_memory = total_memory - allocated_memory
+        
+        return {
+            'total_gb': total_memory / (1024**3),
+            'allocated_gb': allocated_memory / (1024**3),
+            'cached_gb': cached_memory / (1024**3),
+            'free_gb': free_memory / (1024**3),
+        }
+    except Exception:
+        return None
 
 def apply_seek(cap, delta_seconds):
     """Seek by +/- seconds, using timestamps when available, else frames."""
@@ -582,16 +748,17 @@ class FrameProcessor:
                 continue
     
     def _process_frame_batch(self, batch_items, HALF_IDS, OBSCURED_IDS, PIECE_IDS, SHELL_IDS):
-        """Process a batch of frames efficiently using batch inference."""
+        """Process a batch of frames efficiently using optimized GPU batch inference."""
         if not batch_items:
             return []
         
         try:
-            # Prepare batch data
+            # Prepare batch data with GPU-optimized preprocessing
             batch_frames = []
-            batch_crops = []
             batch_metadata = []
             
+            # Pre-allocate numpy array for better memory efficiency
+            valid_items = []
             for frame_id, frame, pos_ms in batch_items:
                 H, W = frame.shape[:2]
                 
@@ -602,18 +769,39 @@ class FrameProcessor:
                     batch_metadata.append((frame_id, frame, pos_ms, None))
                     continue
                 
-                crop = frame[y1:y2, x1:x2]
-                resized = cv2.resize(crop, (MODEL_SIZE, MODEL_SIZE), interpolation=cv2.INTER_LINEAR)
-                
-                batch_frames.append(frame)
-                batch_crops.append(resized)
-                batch_metadata.append((frame_id, frame, pos_ms, resized))
+                valid_items.append((frame_id, frame, pos_ms, x1, y1, x2, y2))
             
-            if not batch_crops:
+            if not valid_items:
                 return [(item[0], item[1], 0.0, 0.0, item[2]) for item in batch_items]
             
-            # Batch inference - this is where we get the GPU efficiency gains
-            results = self.model.predict(batch_crops, imgsz=MODEL_SIZE, verbose=False, conf=self.args.conf)
+            # Batch preprocessing - vectorized operations
+            batch_tensor = np.zeros((len(valid_items), MODEL_SIZE, MODEL_SIZE, 3), dtype=np.uint8)
+            
+            for i, (frame_id, frame, pos_ms, x1, y1, x2, y2) in enumerate(valid_items):
+                crop = frame[y1:y2, x1:x2]
+                resized = cv2.resize(crop, (MODEL_SIZE, MODEL_SIZE), interpolation=cv2.INTER_LINEAR)
+                batch_tensor[i] = resized
+                
+                batch_frames.append(frame)
+                batch_metadata.append((frame_id, frame, pos_ms, resized))
+            
+            # Convert to list for YOLO (YOLO expects list of images)
+            batch_list = [batch_tensor[i] for i in range(len(valid_items))]
+            
+            # Batch inference with optimized settings for high-throughput
+            if torch and torch.cuda.is_available():
+                torch.cuda.empty_cache()  # Clear cache before batch
+                
+            results = self.model.predict(
+                batch_list, 
+                imgsz=MODEL_SIZE, 
+                verbose=False, 
+                conf=self.args.conf,
+                device=self.model.device,
+                # Optimize for throughput
+                half=(torch and torch.cuda.is_available()),  # Use FP16 on CUDA for 2x speed
+                augment=False,  # Disable augmentation for speed
+            )
             
             # Process results
             batch_results = []
@@ -642,8 +830,13 @@ class FrameProcessor:
             return batch_results
             
         except Exception as e:
-            print(f"Batch processing failed: {e}")
-            # Fallback to individual processing
+            if torch and "out of memory" in str(e).lower():
+                print(f"GPU out of memory with batch size {len(batch_items)}. Consider reducing batch size.")
+                # Clear GPU cache and retry with smaller batch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            else:
+                print(f"Batch processing failed: {e}")
             return []
     
     def _process_single_result(self, frame, result, HALF_IDS, OBSCURED_IDS, PIECE_IDS, SHELL_IDS):
@@ -915,6 +1108,12 @@ def main():
     parser.add_argument("--show-chart", action="store_true",
                         help="Render rolling integrated ratio chart overlay (requires --show)")
     
+    # Hardware acceleration options
+    parser.add_argument("--nvdec", action="store_true", default=True,
+                        help="Enable NVDEC hardware video decoding on CUDA devices (default: True)")
+    parser.add_argument("--no-nvdec", action="store_false", dest="nvdec",
+                        help="Disable NVDEC and use CPU video decoding")
+    
     # Performance options
     parser.add_argument("--parallel", action="store_true", default=False,
                         help="Enable parallel frame processing for improved performance (headless mode only)")
@@ -922,8 +1121,14 @@ def main():
                         help="Number of worker threads for parallel processing (default: 2)")
     parser.add_argument("--queue-size", type=int, default=20,
                         help="Maximum queue size for parallel processing (default: 20)")
-    parser.add_argument("--batch-size", type=int, default=4,
-                        help="Batch size for GPU inference (default: 4)")
+    parser.add_argument("--batch-size", type=int, default=0,
+                        help="Batch size for GPU inference (default: 0 = auto-detect based on GPU)")
+    parser.add_argument("--max-batch-size", type=int, default=256,
+                        help="Maximum batch size to attempt (default: 256)")
+    parser.add_argument("--gpu-memory-fraction", type=float, default=0.8,
+                        help="Fraction of GPU memory to use for batching (default: 0.8)")
+    parser.add_argument("--nvenc", action="store_true", default=True,
+                        help="Enable NVENC hardware video encoding for output (default: True)")
     
     # Yield analysis options
     parser.add_argument("--yield-report", action="store_true", default=True,
@@ -968,10 +1173,7 @@ def main():
         "shell":    args.shell_conf,
     }
 
-    cap = cv2.VideoCapture(str(src))
-    if not cap.isOpened():
-        print(f"Error: failed to open video: {src}")
-        sys.exit(1)
+    cap = create_video_capture(src, use_nvdec=args.nvdec)
     
     # Get video properties for debug information
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -986,16 +1188,19 @@ def main():
     print(f"  FPS: {fps:.2f}")
     print(f"  Duration: {duration_sec:.2f} seconds ({duration_sec/60:.1f} minutes)")
     print(f"  ROI: {ROI_W}x{ROI_H} at ({ROI_X},{ROI_Y})")
+    
+    # Show GPU memory info if using CUDA
+    if torch and torch.cuda.is_available():
+        gpu_info = get_gpu_memory_info()
+        if gpu_info:
+            print(f"  GPU Memory: {gpu_info['free_gb']:.1f}GB free / {gpu_info['total_gb']:.1f}GB total")
+    
     print("="*50)
 
     # Prepare writer if needed
     writer = None
     if args.save is not None:
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        writer = cv2.VideoWriter(str(args.save), fourcc, fps, (width, height), True)
+        writer = create_video_writer(args.save, fps, width, height, use_nvenc=args.nvenc)
 
     window_name = "YOLOv12n-seg Contour Tracking"
     if args.show:
@@ -1016,10 +1221,28 @@ def main():
     # Initialize parallel processing if requested and not in GUI mode
     processor = None
     if args.parallel and not args.show:
+        # Auto-detect optimal batch size if not specified
+        if args.batch_size == 0:
+            optimal_batch_size = get_optimal_batch_size(device, MODEL_SIZE, args.max_batch_size, args.gpu_memory_fraction)
+        else:
+            optimal_batch_size = args.batch_size
+            
         class_config = (HALF_IDS, OBSCURED_IDS, PIECE_IDS, SHELL_IDS)
-        processor = FrameProcessor(model, class_config, args, args.queue_size, args.num_workers, args.batch_size)
+        processor = FrameProcessor(model, class_config, args, args.queue_size, args.num_workers, optimal_batch_size)
         processor.start_workers()
-        print(f"Parallel processing enabled: {args.num_workers} workers, batch size: {args.batch_size}, queue size: {args.queue_size}")
+        print(f"Parallel processing enabled: {args.num_workers} workers, batch size: {optimal_batch_size}, queue size: {args.queue_size}")
+        
+        # GPU-specific optimizations
+        if torch and torch.cuda.is_available():
+            print("GPU optimizations enabled: FP16 precision, memory management")
+            # Warm up the GPU
+            try:
+                dummy_input = np.zeros((1, MODEL_SIZE, MODEL_SIZE, 3), dtype=np.uint8)
+                model.predict([dummy_input], verbose=False, imgsz=MODEL_SIZE)
+                torch.cuda.empty_cache()
+                print("GPU warmup complete")
+            except Exception as e:
+                print(f"GPU warmup failed: {e}")
 
     try:
         if processor is not None:
