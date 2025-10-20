@@ -5,20 +5,54 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11, <=3.13"
 dependencies = [
-    "ultralytics>=8.3.196",
-    "torch>=2.2.2",
-    "torchvision>=0.17.2",
-    "torchaudio>=2.2.2",
-    "markupsafe<=3",
-    "numpy<2,>=1.26.0",
-    "nvidia-ml-py>=12",
-    "dotenv>=0.9.9",
-    "opencv-python"
+  "ultralytics>=8.3.196",
+  "torch>=2.2.2",
+  "torchvision>=0.17.2",
+  "torchaudio>=2.2.2",
+  "markupsafe<=3",
+  "numpy<2,>=1.26.0",
+  "dotenv>=0.9.9",
+  "opencv-python",
 ]
+
+# Platform-specific dependencies for GPU acceleration
+[project.optional-dependencies]
+cuda = [
+  "nvidia-ml-py>=12",
+]
+
+[tool.pixi.project]
+channels = ["conda-forge", "pytorch"]
+platforms = ["linux-64", "win-64", "osx-64", "osx-arm64"]
+
+# Base dependencies for all platforms  
+[tool.pixi.dependencies]
+python = ">=3.11, <=3.13"
+pip = "*"
+numpy = "<2,>=1.26.0"
+
+# Use pip for Python packages that are easier to manage via PyPI
+[tool.pixi.pypi-dependencies]
+ultralytics = ">=8.3.196"
+markupsafe = "<=3"
+python-dotenv = ">=0.9.9"
+opencv-python = "*"
+torch = "*"
+torchvision = "*"
+torchaudio = "*"
+
+# Platform-specific dependencies (for CUDA on Linux/Windows)
+[tool.pixi.target.linux-64.pypi-dependencies]
+nvidia-ml-py = ">=12"
+
+[tool.pixi.target.win-64.pypi-dependencies]
+nvidia-ml-py = ">=12"
+
+# Development tasks
+[tool.pixi.tasks]
+run = "KMP_DUPLICATE_LIB_OK=TRUE python main.py"
+test-device = "KMP_DUPLICATE_LIB_OK=TRUE python test_device.py"
+install-dev = "pip install -e ."
 
 [tool.setuptools.packages.find]
 exclude = []
-
-[[tool.uv.index]]
-name = "pytorch"
-url = "https://download.pytorch.org/whl/cu124"

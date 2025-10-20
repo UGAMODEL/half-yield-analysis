@@ -1,0 +1,59 @@
+# Pixi Project Configuration
+# Simple configuration that works across platforms
+# Run: pixi install && pixi run start
+
+[project]
+name = "half-yield-analysis"
+version = "0.1.0"
+description = "YOLOv12n-seg inference pipeline for pecan half/piece classification with automatic hardware acceleration"
+authors = ["Your Name <your.email@example.com>"]
+channels = ["conda-forge", "pytorch"]
+platforms = ["linux-64", "win-64", "osx-64", "osx-arm64"]
+
+# Base dependencies for all platforms  
+[dependencies]
+python = ">=3.11, <=3.13"
+pip = "*"
+numpy = "<2,>=1.26.0"
+
+# Use pip for Python packages that are easier to manage via PyPI
+[pypi-dependencies]
+ultralytics = ">=8.3.196"
+markupsafe = "<=3"
+python-dotenv = ">=0.9.9"
+opencv-python = "*"
+torch = "*"
+torchvision = "*"
+torchaudio = "*"
+
+# Platform-specific dependencies (for CUDA on Linux/Windows)
+[target.linux-64.pypi-dependencies]
+nvidia-ml-py = ">=12"
+
+[target.win-64.pypi-dependencies]
+nvidia-ml-py = ">=12"
+
+# Development and runtime tasks
+[tasks]
+start = "KMP_DUPLICATE_LIB_OK=TRUE python main.py"
+test-device = "KMP_DUPLICATE_LIB_OK=TRUE python test_device.py"
+install-dev = "pip install -e ."
+shell = "pixi shell"
+
+# Inference tasks
+[tasks.infer]
+cmd = "bash run_inference.sh"
+description = "Run inference with custom arguments: pixi run infer <video> [args]"
+
+# Example tasks for common workflows
+[tasks.demo]
+cmd = "KMP_DUPLICATE_LIB_OK=TRUE python main.py --source video.mp4 --model halfyield-model.pt --show --show-chart"
+description = "Run demo with sample video"
+
+[tasks.run-latest]
+cmd = "KMP_DUPLICATE_LIB_OK=TRUE python main.py --source latest.mp4 --model halfyield-model.pt --show --show-chart"
+description = "Run inference on latest.mp4"
+
+[tasks.test-yield]
+cmd = "KMP_DUPLICATE_LIB_OK=TRUE python test_yield.py"
+description = "Test yield analysis functionality"

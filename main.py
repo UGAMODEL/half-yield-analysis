@@ -19,6 +19,9 @@ import argparse
 import sys
 from pathlib import Path
 from collections import deque
+import threading
+import queue
+import time
 
 import cv2
 import numpy as np
@@ -30,6 +33,13 @@ except Exception:
     print("Error: Ultralytics not installed. Try: pip install ultralytics")
     raise
 
+# PyTorch for device detection
+try:
+    import torch
+except ImportError:
+    torch = None
+    print("Warning: PyTorch not available. Falling back to CPU inference.")
+
 # ---- ROI & model input ----
 # Crop a 500 (width) x 600 (height) region whose top-left is (x=400, y=300).
 ROI_X, ROI_Y = 400, 300
@@ -37,6 +47,34 @@ ROI_W, ROI_H = 500, 600
 MODEL_SIZE = 640  # 640x640 input for the model
 
 SKIP_DEFAULT = 5  # seconds to skip on arrow keys when playing
+
+
+# ======================= Device Detection =======================
+
+def get_optimal_device():
+    """
+    Automatically detect the best available device for inference.
+    Returns the optimal device string for the current platform.
+    """
+    if torch is None:
+        print("PyTorch not available. Using CPU.")
+        return "cpu"
+    
+    # Check for CUDA (NVIDIA GPU)
+    if torch.cuda.is_available():
+        device_count = torch.cuda.device_count()
+        device_name = torch.cuda.get_device_name(0) if device_count > 0 else "Unknown"
+        print(f"CUDA available: {device_count} device(s). Using GPU: {device_name}")
+        return "cuda:0"
+    
+    # Check for MPS (Apple Silicon Metal Performance Shaders)
+    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        print("Apple Metal Performance Shaders (MPS) available. Using MPS acceleration.")
+        return "mps"
+    
+    # Fallback to CPU
+    print("No GPU acceleration available. Using CPU.")
+    return "cpu"
 
 
 # ======================= Utilities =======================
@@ -272,6 +310,454 @@ def draw_ratio_chart_time(canvas, samples_ratio, w, h, corner="bl", label_prefix
     canvas[y0:y0+h, x0:x0+w] = panel
 
 
+# ======================= Yield Analysis =======================
+
+def calculate_yield_statistics(area_hist, bin_duration_sec=10.0):
+    """
+    Calculate yield statistics from area history.
+    
+    Args:
+        area_hist: deque of (t_ms, half_area, piece_area) tuples
+        bin_duration_sec: Duration of time bins in seconds for binned analysis
+    
+    Returns:
+        dict containing:
+        - net_average: Overall yield ratio
+        - total_half_area: Sum of all half areas
+        - total_piece_area: Sum of all piece areas
+        - total_area: Sum of half + piece areas
+        - duration_sec: Total video duration processed
+        - binned_data: List of (bin_start_sec, bin_yield, bin_half, bin_piece) tuples
+    """
+    if len(area_hist) < 2:
+        return {
+            'net_average': 0.0,
+            'total_half_area': 0.0,
+            'total_piece_area': 0.0,
+            'total_area': 0.0,
+            'duration_sec': 0.0,
+            'binned_data': []
+        }
+    
+    # Convert to lists for easier processing
+    samples = list(area_hist)
+    
+    # Calculate overall statistics using integration over time
+    total_half_integrated = 0.0
+    total_piece_integrated = 0.0
+    
+    # Integrate using left-Riemann sum (same as the ratio calculation)
+    for i in range(len(samples) - 1):
+        t0, half0, piece0 = samples[i]
+        t1, _, _ = samples[i + 1]
+        dt_sec = (t1 - t0) / 1000.0  # Convert ms to seconds
+        
+        total_half_integrated += half0 * dt_sec
+        total_piece_integrated += piece0 * dt_sec
+    
+    # Calculate net average yield
+    total_integrated = total_half_integrated + total_piece_integrated
+    net_average = total_half_integrated / total_integrated if total_integrated > 0 else 0.0
+    
+    # Calculate duration
+    duration_sec = (samples[-1][0] - samples[0][0]) / 1000.0 if len(samples) > 1 else 0.0
+    
+    # Calculate binned statistics
+    binned_data = []
+    if duration_sec > 0:
+        bin_duration_ms = bin_duration_sec * 1000.0
+        start_time = samples[0][0]
+        end_time = samples[-1][0]
+        
+        current_bin_start = start_time
+        while current_bin_start < end_time:
+            current_bin_end = min(current_bin_start + bin_duration_ms, end_time)
+            
+            # Find samples in this bin
+            bin_half = 0.0
+            bin_piece = 0.0
+            
+            for i in range(len(samples) - 1):
+                t0, half0, piece0 = samples[i]
+                t1, _, _ = samples[i + 1]
+                
+                # Check if segment overlaps with bin
+                seg_start = max(t0, current_bin_start)
+                seg_end = min(t1, current_bin_end)
+                
+                if seg_end > seg_start:
+                    dt_sec = (seg_end - seg_start) / 1000.0
+                    bin_half += half0 * dt_sec
+                    bin_piece += piece0 * dt_sec
+            
+            # Calculate yield for this bin
+            bin_total = bin_half + bin_piece
+            bin_yield = bin_half / bin_total if bin_total > 0 else 0.0
+            
+            bin_start_sec = (current_bin_start - start_time) / 1000.0
+            binned_data.append((bin_start_sec, bin_yield, bin_half, bin_piece))
+            
+            current_bin_start = current_bin_end
+    
+    return {
+        'net_average': net_average,
+        'total_half_area': total_half_integrated,
+        'total_piece_area': total_piece_integrated,
+        'total_area': total_integrated,
+        'duration_sec': duration_sec,
+        'binned_data': binned_data
+    }
+
+
+def save_yield_report(stats, output_path=None, video_path=None):
+    """
+    Save yield analysis to CSV file and print to stdout.
+    
+    Args:
+        stats: Dictionary from calculate_yield_statistics()
+        output_path: Optional path for CSV output (defaults to video_name + '_yield_analysis.csv')
+        video_path: Original video path for naming
+    """
+    import csv
+    from datetime import datetime
+    
+    # Generate default output path if not provided
+    if output_path is None:
+        if video_path:
+            video_stem = Path(video_path).stem
+            output_path = f"{video_stem}_yield_analysis.csv"
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = f"yield_analysis_{timestamp}.csv"
+    
+    # Print summary to stdout
+    print("\n" + "="*60)
+    print("HALF YIELD ANALYSIS REPORT")
+    print("="*60)
+    print(f"Video Duration: {stats['duration_sec']:.2f} seconds")
+    print(f"Total Half Area (integrated): {stats['total_half_area']:.2f}")
+    print(f"Total Piece Area (integrated): {stats['total_piece_area']:.2f}")
+    print(f"Total Area (half + piece): {stats['total_area']:.2f}")
+    print(f"NET AVERAGE YIELD: {stats['net_average']:.4f} ({stats['net_average']*100:.2f}%)")
+    print("="*60)
+    
+    if stats['binned_data']:
+        print(f"\nYield over time (10-second bins):")
+        print(f"{'Time (s)':>8} {'Yield':>8} {'Half Area':>12} {'Piece Area':>12}")
+        print("-" * 44)
+        for bin_start, bin_yield, bin_half, bin_piece in stats['binned_data']:
+            print(f"{bin_start:8.1f} {bin_yield:8.4f} {bin_half:12.2f} {bin_piece:12.2f}")
+    
+    # Save to CSV
+    try:
+        with open(output_path, 'w', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            
+            # Write header information
+            writer.writerow(['# Half Yield Analysis Report'])
+            writer.writerow(['# Generated:', datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
+            if video_path:
+                writer.writerow(['# Video:', str(video_path)])
+            writer.writerow(['# Duration (seconds):', f"{stats['duration_sec']:.2f}"])
+            writer.writerow(['# Net Average Yield:', f"{stats['net_average']:.6f}"])
+            writer.writerow(['# Total Half Area:', f"{stats['total_half_area']:.2f}"])
+            writer.writerow(['# Total Piece Area:', f"{stats['total_piece_area']:.2f}"])
+            writer.writerow([''])
+            
+            # Write binned data
+            writer.writerow(['Time_Start_Seconds', 'Yield_Ratio', 'Half_Area_Integrated', 'Piece_Area_Integrated', 'Total_Area'])
+            for bin_start, bin_yield, bin_half, bin_piece in stats['binned_data']:
+                writer.writerow([f"{bin_start:.1f}", f"{bin_yield:.6f}", f"{bin_half:.2f}", f"{bin_piece:.2f}", f"{bin_half + bin_piece:.2f}"])
+        
+        print(f"\nDetailed analysis saved to: {output_path}")
+        
+    except Exception as e:
+        print(f"\nWarning: Could not save CSV file '{output_path}': {e}")
+    
+    print("="*60 + "\n")
+
+
+# ======================= Parallel Processing =======================
+
+class FrameProcessor:
+    """Multi-threaded frame processor with batch processing for improved GPU utilization."""
+    
+    def __init__(self, model, class_config, args, max_queue_size=20, num_workers=2, batch_size=4):
+        self.model = model
+        self.class_config = class_config
+        self.args = args
+        self.frame_queue = queue.Queue(maxsize=max_queue_size)
+        self.result_queue = queue.Queue(maxsize=max_queue_size)
+        self.stop_event = threading.Event()
+        self.num_workers = num_workers
+        self.batch_size = batch_size
+        self.workers = []
+        
+    def start_workers(self):
+        """Start worker threads for parallel processing."""
+        for i in range(self.num_workers):
+            worker = threading.Thread(target=self._worker_loop, name=f"Worker-{i}")
+            worker.daemon = True
+            worker.start()
+            self.workers.append(worker)
+    
+    def stop_workers(self):
+        """Stop all worker threads."""
+        self.stop_event.set()
+        # Add sentinel values to unblock workers
+        for _ in range(self.num_workers):
+            try:
+                self.frame_queue.put(None, timeout=1.0)
+            except queue.Full:
+                pass
+        
+        # Wait for workers to finish
+        for worker in self.workers:
+            worker.join(timeout=2.0)
+    
+    def _worker_loop(self):
+        """Worker thread main loop with batch processing."""
+        HALF_IDS, OBSCURED_IDS, PIECE_IDS, SHELL_IDS = self.class_config
+        
+        while not self.stop_event.is_set():
+            try:
+                # Collect a batch of frames
+                batch_items = []
+                
+                # Try to get batch_size items, but don't wait too long for a full batch
+                for _ in range(self.batch_size):
+                    try:
+                        item = self.frame_queue.get(timeout=0.1)
+                        if item is None:  # Sentinel value
+                            if batch_items:
+                                break  # Process what we have
+                            else:
+                                return  # Exit worker
+                        batch_items.append(item)
+                    except queue.Empty:
+                        if batch_items:
+                            break  # Process partial batch
+                        else:
+                            continue  # Keep waiting
+                
+                if not batch_items:
+                    continue
+                
+                # Process batch
+                try:
+                    batch_results = self._process_frame_batch(batch_items, HALF_IDS, OBSCURED_IDS, PIECE_IDS, SHELL_IDS)
+                    
+                    # Put results back
+                    for result in batch_results:
+                        try:
+                            self.result_queue.put(result, timeout=1.0)
+                        except queue.Full:
+                            break  # Skip remaining if queue is full
+                            
+                except Exception as e:
+                    print(f"Batch processing error: {e}")
+                    # Fall back to individual processing
+                    for item in batch_items:
+                        try:
+                            frame_id, frame, pos_ms = item
+                            out, half_area, piece_area = process_frame(
+                                frame, self.model,
+                                HALF_IDS, OBSCURED_IDS, PIECE_IDS, SHELL_IDS,
+                                base_conf=self.args.conf,
+                                class_thresh={
+                                    "half": self.args.half_conf,
+                                    "obscured": self.args.obscured_conf, 
+                                    "piece": self.args.piece_conf,
+                                    "shell": self.args.shell_conf,
+                                },
+                                min_area_px=self.args.min_area,
+                            )
+                            self.result_queue.put((frame_id, out, half_area, piece_area, pos_ms), timeout=1.0)
+                        except Exception as inner_e:
+                            print(f"Individual frame processing error: {inner_e}")
+                            continue
+                    
+            except Exception as e:
+                print(f"Worker error: {e}")
+                continue
+    
+    def _process_frame_batch(self, batch_items, HALF_IDS, OBSCURED_IDS, PIECE_IDS, SHELL_IDS):
+        """Process a batch of frames efficiently using batch inference."""
+        if not batch_items:
+            return []
+        
+        try:
+            # Prepare batch data
+            batch_frames = []
+            batch_crops = []
+            batch_metadata = []
+            
+            for frame_id, frame, pos_ms in batch_items:
+                H, W = frame.shape[:2]
+                
+                # Crop ROI bounds and check
+                x1, y1 = ROI_X, ROI_Y
+                x2, y2 = min(ROI_X + ROI_W, W), min(ROI_Y + ROI_H, H)
+                if x1 >= x2 or y1 >= y2:
+                    batch_metadata.append((frame_id, frame, pos_ms, None))
+                    continue
+                
+                crop = frame[y1:y2, x1:x2]
+                resized = cv2.resize(crop, (MODEL_SIZE, MODEL_SIZE), interpolation=cv2.INTER_LINEAR)
+                
+                batch_frames.append(frame)
+                batch_crops.append(resized)
+                batch_metadata.append((frame_id, frame, pos_ms, resized))
+            
+            if not batch_crops:
+                return [(item[0], item[1], 0.0, 0.0, item[2]) for item in batch_items]
+            
+            # Batch inference - this is where we get the GPU efficiency gains
+            results = self.model.predict(batch_crops, imgsz=MODEL_SIZE, verbose=False, conf=self.args.conf)
+            
+            # Process results
+            batch_results = []
+            result_idx = 0
+            
+            for frame_id, frame, pos_ms, resized_crop in batch_metadata:
+                if resized_crop is None:
+                    # Invalid crop
+                    batch_results.append((frame_id, frame, 0.0, 0.0, pos_ms))
+                    continue
+                
+                # Get corresponding result
+                if result_idx < len(results):
+                    r = results[result_idx]
+                    result_idx += 1
+                    
+                    # Process this frame's result
+                    out, half_area, piece_area = self._process_single_result(
+                        frame, r, HALF_IDS, OBSCURED_IDS, PIECE_IDS, SHELL_IDS
+                    )
+                    batch_results.append((frame_id, out, half_area, piece_area, pos_ms))
+                else:
+                    # No result available
+                    batch_results.append((frame_id, frame, 0.0, 0.0, pos_ms))
+            
+            return batch_results
+            
+        except Exception as e:
+            print(f"Batch processing failed: {e}")
+            # Fallback to individual processing
+            return []
+    
+    def _process_single_result(self, frame, result, HALF_IDS, OBSCURED_IDS, PIECE_IDS, SHELL_IDS):
+        """Process a single inference result."""
+        polygons = []  # (poly_xy_full, class_id)
+        half_area_sum = 0.0
+        piece_area_sum = 0.0
+
+        has_masks = getattr(result, "masks", None) is not None and getattr(result.masks, "xy", None) is not None
+        has_boxes = getattr(result, "boxes", None) is not None
+
+        if has_masks and has_boxes and len(result.masks.xy) and len(result.boxes.cls):
+            classes = result.boxes.cls.detach().cpu().numpy().astype(int)
+            confs   = result.boxes.conf.detach().cpu().numpy().astype(float)
+
+            # Per-detection thresholds
+            thresh = np.full_like(confs, float(self.args.conf), dtype=float)
+
+            class_thresh = {
+                "half": self.args.half_conf,
+                "obscured": self.args.obscured_conf, 
+                "piece": self.args.piece_conf,
+                "shell": self.args.shell_conf,
+            }
+
+            if HALF_IDS:
+                thr = class_thresh.get("half")
+                if thr is not None:
+                    thresh[np.isin(classes, list(HALF_IDS))] = float(thr)
+
+            if OBSCURED_IDS:
+                thr = class_thresh.get("obscured")
+                if thr is not None:
+                    thresh[np.isin(classes, list(OBSCURED_IDS))] = float(thr)
+
+            if PIECE_IDS:
+                thr = class_thresh.get("piece")
+                if thr is not None:
+                    thresh[np.isin(classes, list(PIECE_IDS))] = float(thr)
+
+            if SHELL_IDS:
+                thr = class_thresh.get("shell")
+                if thr is not None:
+                    thresh[np.isin(classes, list(SHELL_IDS))] = float(thr)
+
+            keep = np.where(confs >= thresh)[0]
+
+            # scale back to full-frame
+            sx, sy = ROI_W / MODEL_SIZE, ROI_H / MODEL_SIZE
+
+            for i in keep:
+                seg_xy = result.masks.xy[i]
+                if seg_xy is None or len(seg_xy) == 0:
+                    continue
+
+                # Robust model-space area
+                try:
+                    m = result.masks.data[i]
+                    area_i = float((m > 0.5).sum().item())
+                except Exception:
+                    cnt_model = np.asarray(seg_xy, np.float32).reshape(-1, 1, 2)
+                    area_i = float(abs(cv2.contourArea(cnt_model)))
+
+                if area_i >= float(self.args.min_area):
+                    cid = int(classes[i])
+                    # Areas for integration
+                    if cid in HALF_IDS:
+                        half_area_sum += area_i
+                    if cid in PIECE_IDS:
+                        piece_area_sum += area_i
+
+                # Map polygon to full frame for drawing
+                seg_xy = np.asarray(seg_xy, dtype=np.float32)
+                seg_xy[:, 0] = seg_xy[:, 0] * sx + ROI_X
+                seg_xy[:, 1] = seg_xy[:, 1] * sy + ROI_Y
+                polygons.append((seg_xy, int(classes[i])))
+
+        # Compose output frame
+        out = frame.copy()
+        cv2.rectangle(out, (ROI_X, ROI_Y), (ROI_X + ROI_W, ROI_Y + ROI_H), (255, 255, 255), 1)
+
+        id_to_name, _ = names_maps(self.model.names)
+
+        for poly, cid in polygons:
+            pts = np.round(poly).astype(np.int32).reshape(-1, 1, 2)
+            cv2.polylines(out, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
+
+            # class label above centroid
+            M = cv2.moments(pts)
+            if M["m00"] != 0:
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+                label = str(id_to_name.get(int(cid), int(cid)))
+                cv2.putText(out, label, (cx, cy - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+
+        return out, half_area_sum, piece_area_sum
+
+    def add_frame(self, frame_id, frame, pos_ms):
+        """Add frame for processing (non-blocking)."""
+        try:
+            self.frame_queue.put((frame_id, frame, pos_ms), block=False)
+            return True
+        except queue.Full:
+            return False
+    
+    def get_result(self, timeout=0.1):
+        """Get processed result (non-blocking)."""
+        try:
+            return self.result_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+
 # ======================= Core processing =======================
 
 def process_frame(
@@ -397,7 +883,9 @@ def main():
     parser = argparse.ArgumentParser(description="YOLOv12n-seg contour tracking with integrated ratio chart and per-class thresholds.")
     parser.add_argument("--source", required=True, help="Path to input video file.")
     parser.add_argument("--model", default="halfyield-model.pt", help="Path to YOLOv12n-seg model (.pt).")
-    parser.add_argument("--device", default=None, help="Device string (e.g., '0', 'cuda:0', or 'cpu').")
+    parser.add_argument("--device", default=None, 
+                        help="Device string (e.g., '0', 'cuda:0', 'mps', or 'cpu'). "
+                             "If not specified, automatically detects the best available device.")
     parser.add_argument("--save", default=None, help="Optional output video path to write.")
     parser.add_argument("--show", action="store_true", help="Show a live window.")
 
@@ -426,6 +914,26 @@ def main():
                         help="Chart corner: tl, tr, bl, br (default: bl)")
     parser.add_argument("--show-chart", action="store_true",
                         help="Render rolling integrated ratio chart overlay (requires --show)")
+    
+    # Performance options
+    parser.add_argument("--parallel", action="store_true", default=False,
+                        help="Enable parallel frame processing for improved performance (headless mode only)")
+    parser.add_argument("--num-workers", type=int, default=2,
+                        help="Number of worker threads for parallel processing (default: 2)")
+    parser.add_argument("--queue-size", type=int, default=20,
+                        help="Maximum queue size for parallel processing (default: 20)")
+    parser.add_argument("--batch-size", type=int, default=4,
+                        help="Batch size for GPU inference (default: 4)")
+    
+    # Yield analysis options
+    parser.add_argument("--yield-report", action="store_true", default=True,
+                        help="Generate yield analysis report on exit (default: True)")
+    parser.add_argument("--no-yield-report", action="store_false", dest="yield_report",
+                        help="Disable yield analysis report")
+    parser.add_argument("--yield-output", type=str, default=None,
+                        help="Output path for yield analysis CSV (default: auto-generated)")
+    parser.add_argument("--yield-bin-seconds", type=float, default=10.0,
+                        help="Time bin duration in seconds for yield analysis (default: 10.0)")
 
     args = parser.parse_args()
 
@@ -436,8 +944,15 @@ def main():
 
     # Load model
     model = YOLO(args.model)
+    
+    # Set device - use automatic detection if not specified
     if args.device is not None:
-        model.to(args.device)
+        device = args.device
+        print(f"Using specified device: {device}")
+    else:
+        device = get_optimal_device()
+    
+    model.to(device)
 
     # Build class-id sets once from model names
     id_to_name, _ = names_maps(model.names)
@@ -457,6 +972,21 @@ def main():
     if not cap.isOpened():
         print(f"Error: failed to open video: {src}")
         sys.exit(1)
+    
+    # Get video properties for debug information
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    duration_sec = total_frames / fps if fps > 0 else 0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    print(f"Video loaded: {src}")
+    print(f"  Resolution: {width}x{height}")
+    print(f"  Total frames: {total_frames}")
+    print(f"  FPS: {fps:.2f}")
+    print(f"  Duration: {duration_sec:.2f} seconds ({duration_sec/60:.1f} minutes)")
+    print(f"  ROI: {ROI_W}x{ROI_H} at ({ROI_X},{ROI_Y})")
+    print("="*50)
 
     # Prepare writer if needed
     writer = None
@@ -474,141 +1004,255 @@ def main():
     paused = False
     slow = False
     # Store raw areas per timestamp (t_ms, half_area, piece_area)
-    area_hist = deque()
+    area_hist = deque()  # For real-time ratio calculation (trimmed to window)
+    complete_area_hist = deque()  # For final yield analysis (never trimmed)
     last_frame = None  # reuse current frame while paused
+    
+    # Progress tracking
+    frame_count = 0
+    last_progress_update = 0
+    progress_update_interval = max(1, total_frames // 100)  # Update every 1% or at least every frame
+
+    # Initialize parallel processing if requested and not in GUI mode
+    processor = None
+    if args.parallel and not args.show:
+        class_config = (HALF_IDS, OBSCURED_IDS, PIECE_IDS, SHELL_IDS)
+        processor = FrameProcessor(model, class_config, args, args.queue_size, args.num_workers, args.batch_size)
+        processor.start_workers()
+        print(f"Parallel processing enabled: {args.num_workers} workers, batch size: {args.batch_size}, queue size: {args.queue_size}")
 
     try:
-        while True:
-            if not paused:
-                ret, frame = cap.read()
-                if not ret:
+        if processor is not None:
+            # Parallel processing mode (headless only)
+            pending_results = {}  # frame_id -> (pos_ms, timestamp)
+            next_frame_id = 0
+            ret = True  # Initialize ret
+            
+            while True:
+                # Read and queue frames
+                while len(pending_results) < args.queue_size:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    
+                    pos_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+                    if processor.add_frame(next_frame_id, frame, pos_ms):
+                        pending_results[next_frame_id] = (pos_ms, time.time())
+                        next_frame_id += 1
+                    else:
+                        # Queue full, process results
+                        break
+                
+                # Process results in order
+                result = processor.get_result(timeout=0.1)
+                if result is not None:
+                    result_frame_id, out, half_area, piece_area, result_pos_ms = result
+                    
+                    # Process this result
+                    frame_count += 1
+                    
+                    # Update progress
+                    if (frame_count - last_progress_update) >= progress_update_interval:
+                        progress = (frame_count / total_frames) * 100 if total_frames > 0 else 0
+                        
+                        bar_width = 40
+                        filled = int(bar_width * progress / 100)
+                        bar = '█' * filled + '░' * (bar_width - filled)
+                        
+                        print(f"\rProcessing: [{bar}] {progress:.1f}% "
+                              f"(Frame {frame_count}/{total_frames})", end='', flush=True)
+                        last_progress_update = frame_count
+                    
+                    # Store data for analysis
+                    if np.isfinite(result_pos_ms):
+                        data_point = (float(result_pos_ms), float(half_area), float(piece_area))
+                        complete_area_hist.append(data_point)
+                    
+                    # Save video frame
+                    if writer is not None:
+                        writer.write(out)
+                    
+                    # Clean up
+                    if result_frame_id in pending_results:
+                        del pending_results[result_frame_id]
+                
+                # Check if we're done
+                if not ret and len(pending_results) == 0:
                     break
-                last_frame = frame
-            else:
-                # When paused, use the last captured frame
-                if last_frame is None:
+                
+                # Small delay to prevent busy waiting
+                if not pending_results:
+                    time.sleep(0.001)
+        else:
+            # Original single-threaded processing
+            while True:
+                if not paused:
                     ret, frame = cap.read()
                     if not ret:
                         break
                     last_frame = frame
-                frame = last_frame
+                    frame_count += 1
+                    
+                    # Update progress bar (only when not showing GUI to avoid spam)
+                    if not args.show and (frame_count - last_progress_update) >= progress_update_interval:
+                        current_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+                        progress = (current_frame / total_frames) * 100 if total_frames > 0 else 0
+                        elapsed_sec = (cap.get(cv2.CAP_PROP_POS_MSEC) or 0) / 1000.0
+                        
+                        # Simple progress bar
+                        bar_width = 40
+                        filled = int(bar_width * progress / 100)
+                        bar = '█' * filled + '░' * (bar_width - filled)
+                        
+                        print(f"\rProcessing: [{bar}] {progress:.1f}% "
+                              f"(Frame {current_frame}/{total_frames}, "
+                              f"Time: {elapsed_sec:.1f}s/{duration_sec:.1f}s)", end='', flush=True)
+                        last_progress_update = frame_count
+                else:
+                    # When paused, use the last captured frame
+                    if last_frame is None:
+                        ret, frame = cap.read()
+                        if not ret:
+                            break
+                        last_frame = frame
+                    frame = last_frame
 
-            pos_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+                pos_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
 
-            out, half_area, piece_area = process_frame(
-                frame, model,
-                HALF_IDS, OBSCURED_IDS, PIECE_IDS, SHELL_IDS,
-                base_conf=args.conf,
-                class_thresh=class_thresh,
-                min_area_px=args.min_area,
-            )
+                out, half_area, piece_area = process_frame(
+                    frame, model,
+                    HALF_IDS, OBSCURED_IDS, PIECE_IDS, SHELL_IDS,
+                    base_conf=args.conf,
+                    class_thresh=class_thresh,
+                    min_area_px=args.min_area,
+                )
 
-            # Only append when we’re not paused and time advanced
-            if not paused and np.isfinite(pos_ms):
-                area_hist.append((float(pos_ms), float(half_area), float(piece_area)))
+                # Only append when we're not paused and time advanced
+                if not paused and np.isfinite(pos_ms):
+                    data_point = (float(pos_ms), float(half_area), float(piece_area))
+                    area_hist.append(data_point)
+                    complete_area_hist.append(data_point)  # Keep complete history for final analysis
 
-            # Trim by time window (keep only segments overlapping last ratio-window-sec)
-            window_ms = float(args.ratio_window_sec) * 1000.0
-            if area_hist:
-                t_now = area_hist[-1][0]
-                cutoff = t_now - window_ms
-                while len(area_hist) > 1 and area_hist[0][0] < cutoff:
-                    # Keep at least one sample before cutoff to define the leading segment
-                    area_hist.popleft()
+                # Trim by time window (keep only segments overlapping last ratio-window-sec)
+                window_ms = float(args.ratio_window_sec) * 1000.0
+                if area_hist:
+                    t_now = area_hist[-1][0]
+                    cutoff = t_now - window_ms
+                    while len(area_hist) > 1 and area_hist[0][0] < cutoff:
+                        # Keep at least one sample before cutoff to define the leading segment
+                        area_hist.popleft()
 
-            # Save only while playing to keep linear output
-            if writer is not None and not paused:
-                writer.write(out)
+                # Save only while playing to keep linear output
+                if writer is not None and not paused:
+                    writer.write(out)
 
-            if args.show:
-                # Overlay UI hints
-                overlay = out.copy()
-                hint = ("SPACE: pause/play | "
-                        f"←/→: -{float(args.skip_seconds):.1f}s/+{float(args.skip_seconds):.1f}s (play) "
-                        "| prev/next frame (pause) | ,/.: prev/next | S: slow | Q: quit")
-                cv2.putText(overlay, hint, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
-                            (255, 255, 255), 2, cv2.LINE_AA)
-                state = "PAUSED" if paused else "PLAYING"
-                cv2.putText(overlay, state, (12, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                            (0, 255, 255), 2, cv2.LINE_AA)
-
-                # Compute current integrated ratio and (optionally) series for chart
-                ratio_now = integrated_ratio_last(list(area_hist), window_ms)
-                if ratio_now is not None:
-                    cv2.putText(overlay, f"Integrated {int(args.ratio_window_sec)}s ratio: {ratio_now:.3f}",
-                                (12, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                if args.show:
+                    # Overlay UI hints
+                    overlay = out.copy()
+                    hint = ("SPACE: pause/play | "
+                            f"←/→: -{float(args.skip_seconds):.1f}s/+{float(args.skip_seconds):.1f}s (play) "
+                            "| prev/next frame (pause) | ,/.: prev/next | S: slow | Q: quit")
+                    cv2.putText(overlay, hint, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                                 (255, 255, 255), 2, cv2.LINE_AA)
+                    state = "PAUSED" if paused else "PLAYING"
+                    cv2.putText(overlay, state, (12, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                                (0, 255, 255), 2, cv2.LINE_AA)
 
-                cv2.addWeighted(overlay, 0.35, out, 0.65, 0, out)
+                    # Compute current integrated ratio and (optionally) series for chart
+                    ratio_now = integrated_ratio_last(list(area_hist), window_ms)
+                    if ratio_now is not None:
+                        cv2.putText(overlay, f"Integrated {int(args.ratio_window_sec)}s ratio: {ratio_now:.3f}",
+                                    (12, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                                    (255, 255, 255), 2, cv2.LINE_AA)
 
-                if args.show_chart:
-                    series = integrated_ratio_series(list(area_hist), window_ms)
-                    draw_ratio_chart_time(out, series, args.chart_width, args.chart_height,
-                                          corner=args.chart_pos, label_prefix=f"{int(args.ratio_window_sec)}s ratio")
+                    cv2.addWeighted(overlay, 0.35, out, 0.65, 0, out)
 
-                cv2.imshow(window_name, out)
-                k = cv2.waitKey(200 if slow else (150 if paused else 1)) & 0xFFFF
-                action = parse_key(k)
+                    if args.show_chart:
+                        series = integrated_ratio_series(list(area_hist), window_ms)
+                        draw_ratio_chart_time(out, series, args.chart_width, args.chart_height,
+                                              corner=args.chart_pos, label_prefix=f"{int(args.ratio_window_sec)}s ratio")
 
-                if action == 'quit':
-                    break
+                    cv2.imshow(window_name, out)
+                    k = cv2.waitKey(200 if slow else (150 if paused else 1)) & 0xFFFF
+                    action = parse_key(k)
 
-                elif action == 'toggle_pause':
-                    paused = not paused
-                    continue
+                    if action == 'quit':
+                        break
 
-                elif action == 'toggle_slow':
-                    slow = not slow
-                    continue
+                    elif action == 'toggle_pause':
+                        paused = not paused
+                        continue
 
-                elif action == 'left':
-                    if paused:
-                        # prev frame
+                    elif action == 'toggle_slow':
+                        slow = not slow
+                        continue
+
+                    elif action == 'left':
+                        if paused:
+                            # prev frame
+                            apply_step_frame(cap, -1)
+                            ret, frame = cap.read()
+                            if ret:
+                                last_frame = frame
+                        else:
+                            apply_seek(cap, -float(args.skip_seconds))
+                        continue
+
+                    elif action == 'right':
+                        if paused:
+                            # next frame
+                            apply_step_frame(cap, +1)
+                            ret, frame = cap.read()
+                            if ret:
+                                last_frame = frame
+                        else:
+                            apply_seek(cap, +float(args.skip_seconds))
+                        continue
+
+                    elif action == 'prev_frame':
                         apply_step_frame(cap, -1)
                         ret, frame = cap.read()
                         if ret:
                             last_frame = frame
-                    else:
-                        apply_seek(cap, -float(args.skip_seconds))
-                    continue
+                        paused = True
+                        continue
 
-                elif action == 'right':
-                    if paused:
-                        # next frame
+                    elif action == 'next_frame':
                         apply_step_frame(cap, +1)
                         ret, frame = cap.read()
                         if ret:
                             last_frame = frame
-                    else:
-                        apply_seek(cap, +float(args.skip_seconds))
-                    continue
+                        paused = True
+                        continue
 
-                elif action == 'prev_frame':
-                    apply_step_frame(cap, -1)
-                    ret, frame = cap.read()
-                    if ret:
-                        last_frame = frame
-                    paused = True
-                    continue
-
-                elif action == 'next_frame':
-                    apply_step_frame(cap, +1)
-                    ret, frame = cap.read()
-                    if ret:
-                        last_frame = frame
-                    paused = True
-                    continue
-
-            else:
-                # Headless: keep writing if requested (already handled above)
-                pass
+                else:
+                    # Headless: keep writing if requested (already handled above)
+                    pass
 
     finally:
+        # Stop parallel processor if running
+        if processor is not None:
+            processor.stop_workers()
+            
         cap.release()
         if writer is not None:
             writer.release()
         if args.show:
             cv2.destroyAllWindows()
+        
+        # Final progress completion (only if we were showing progress)
+        if not args.show and frame_count > 0:
+            print("\n✓ Processing complete!")
+        
+        # Generate yield analysis report
+        if args.yield_report and len(complete_area_hist) >= 2:
+            try:
+                stats = calculate_yield_statistics(complete_area_hist, args.yield_bin_seconds)
+                save_yield_report(stats, args.yield_output, args.source)
+            except Exception as e:
+                print(f"Warning: Could not generate yield report: {e}")
+        elif args.yield_report and len(complete_area_hist) < 2:
+            print("Warning: Insufficient data for yield analysis (need at least 2 samples)")
 
 
 if __name__ == "__main__":
