@@ -63,10 +63,19 @@ def get_optimal_device():
     # Check for CUDA (NVIDIA GPU)
     if torch.cuda.is_available():
         device_count = torch.cuda.device_count()
-        device_name = torch.cuda.get_device_name(0) if device_count > 0 else "Unknown"
-        memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3) if device_count > 0 else 0
-        print(f"CUDA available: {device_count} device(s). Using GPU: {device_name} ({memory_gb:.1f}GB)")
-        return "cuda:0"
+        if device_count > 1:
+            # Multi-GPU setup
+            print(f"CUDA available: {device_count} device(s). Multi-GPU setup detected.")
+            for i in range(device_count):
+                device_name = torch.cuda.get_device_name(i)
+                memory_gb = torch.cuda.get_device_properties(i).total_memory / (1024**3)
+                print(f"  GPU {i}: {device_name} ({memory_gb:.1f}GB)")
+            return "cuda"  # Return generic cuda for multi-GPU handling
+        else:
+            device_name = torch.cuda.get_device_name(0)
+            memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            print(f"CUDA available: {device_count} device(s). Using GPU: {device_name} ({memory_gb:.1f}GB)")
+            return "cuda:0"
     
     # Check for MPS (Apple Silicon Metal Performance Shaders)
     if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
@@ -76,6 +85,22 @@ def get_optimal_device():
     # Fallback to CPU
     print("No GPU acceleration available. Using CPU.")
     return "cpu"
+
+
+def get_gpu_devices():
+    """Get list of available CUDA devices."""
+    if not torch or not torch.cuda.is_available():
+        return []
+    
+    devices = []
+    for i in range(torch.cuda.device_count()):
+        devices.append({
+            'id': i,
+            'name': torch.cuda.get_device_name(i),
+            'memory_gb': torch.cuda.get_device_properties(i).total_memory / (1024**3),
+            'device_str': f"cuda:{i}"
+        })
+    return devices
 
 
 def get_optimal_batch_size(device, model_size=640, max_batch_size=256, memory_fraction=0.8):
@@ -645,6 +670,257 @@ def save_yield_report(stats, output_path=None, video_path=None):
 
 # ======================= Parallel Processing =======================
 
+class MultiGPUFrameProcessor:
+    """Multi-GPU frame processor for maximum throughput on dual GPU systems."""
+    
+    def __init__(self, model_path, class_config, args, max_queue_size=50, batch_size=32):
+        self.model_path = model_path
+        self.class_config = class_config
+        self.args = args
+        self.frame_queue = queue.Queue(maxsize=max_queue_size)
+        self.result_queue = queue.Queue(maxsize=max_queue_size)
+        self.stop_event = threading.Event()
+        self.batch_size = batch_size
+        self.workers = []
+        self.gpu_devices = get_gpu_devices()
+        
+        if not self.gpu_devices:
+            raise RuntimeError("No CUDA devices available for multi-GPU processing")
+    
+    def start_workers(self):
+        """Start GPU workers, one per available GPU."""
+        for gpu_info in self.gpu_devices:
+            worker = threading.Thread(
+                target=self._gpu_worker_loop, 
+                args=(gpu_info,),
+                name=f"GPU-{gpu_info['id']}-Worker"
+            )
+            worker.daemon = True
+            worker.start()
+            self.workers.append(worker)
+            print(f"Started worker for GPU {gpu_info['id']}: {gpu_info['name']}")
+    
+    def stop_workers(self):
+        """Stop all GPU workers."""
+        self.stop_event.set()
+        # Add sentinel values to unblock workers
+        for _ in range(len(self.gpu_devices)):
+            try:
+                self.frame_queue.put(None, timeout=1.0)
+            except queue.Full:
+                pass
+        
+        # Wait for workers to finish
+        for worker in self.workers:
+            worker.join(timeout=3.0)
+    
+    def _gpu_worker_loop(self, gpu_info):
+        """Worker loop for a specific GPU."""
+        gpu_id = gpu_info['id']
+        device_str = gpu_info['device_str']
+        
+        # Load model on this specific GPU
+        try:
+            from ultralytics import YOLO
+            model = YOLO(self.model_path)
+            model.to(device_str)
+            
+            # GPU-specific optimizations
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.set_device(gpu_id)
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass  # Fall back gracefully if torch not available
+            
+            print(f"GPU {gpu_id} model loaded and ready")
+            
+        except Exception as e:
+            print(f"Failed to initialize model on GPU {gpu_id}: {e}")
+            return
+        
+        HALF_IDS, OBSCURED_IDS, PIECE_IDS, SHELL_IDS = self.class_config
+        
+        while not self.stop_event.is_set():
+            try:
+                # Collect a batch of frames for this GPU
+                batch_items = []
+                
+                for _ in range(self.batch_size):
+                    try:
+                        item = self.frame_queue.get(timeout=0.1)
+                        if item is None:  # Sentinel value
+                            if batch_items:
+                                break  # Process what we have
+                            else:
+                                return  # Exit worker
+                        batch_items.append(item)
+                    except queue.Empty:
+                        if batch_items:
+                            break  # Process partial batch
+                        else:
+                            continue  # Keep waiting
+                
+                if not batch_items:
+                    continue
+                
+                # Process batch on this GPU
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        with torch.cuda.device(gpu_id):
+                            batch_results = self._process_frame_batch_gpu(
+                                batch_items, model, gpu_id, HALF_IDS, OBSCURED_IDS, PIECE_IDS, SHELL_IDS
+                            )
+                    else:
+                        batch_results = self._process_frame_batch_gpu(
+                            batch_items, model, gpu_id, HALF_IDS, OBSCURED_IDS, PIECE_IDS, SHELL_IDS
+                        )
+                        
+                        # Put results back
+                        for result in batch_results:
+                            try:
+                                self.result_queue.put(result, timeout=1.0)
+                            except queue.Full:
+                                break  # Skip remaining if queue is full
+                                
+                except Exception as e:
+                    print(f"GPU {gpu_id} batch processing error: {e}")
+                    # Fall back to individual processing
+                    for item in batch_items:
+                        try:
+                            frame_id, frame, pos_ms = item
+                            out, half_area, piece_area = process_frame(
+                                frame, model,
+                                HALF_IDS, OBSCURED_IDS, PIECE_IDS, SHELL_IDS,
+                                base_conf=self.args.conf,
+                                class_thresh={
+                                    "half": self.args.half_conf,
+                                    "obscured": self.args.obscured_conf, 
+                                    "piece": self.args.piece_conf,
+                                    "shell": self.args.shell_conf,
+                                },
+                                min_area_px=self.args.min_area,
+                            )
+                            self.result_queue.put((frame_id, out, half_area, piece_area, pos_ms), timeout=1.0)
+                        except Exception as inner_e:
+                            print(f"GPU {gpu_id} individual frame processing error: {inner_e}")
+                            continue
+                    
+            except Exception as e:
+                print(f"GPU {gpu_id} worker error: {e}")
+                continue
+    
+    def _process_frame_batch_gpu(self, batch_items, model, gpu_id, HALF_IDS, OBSCURED_IDS, PIECE_IDS, SHELL_IDS):
+        """Process a batch of frames on a specific GPU."""
+        if not batch_items:
+            return []
+        
+        try:
+            # Prepare batch data
+            batch_frames = []
+            batch_metadata = []
+            valid_items = []
+            
+            for frame_id, frame, pos_ms in batch_items:
+                H, W = frame.shape[:2]
+                x1, y1 = ROI_X, ROI_Y
+                x2, y2 = min(ROI_X + ROI_W, W), min(ROI_Y + ROI_H, H)
+                
+                if x1 >= x2 or y1 >= y2:
+                    batch_metadata.append((frame_id, frame, pos_ms, None))
+                    continue
+                
+                valid_items.append((frame_id, frame, pos_ms, x1, y1, x2, y2))
+            
+            if not valid_items:
+                return [(item[0], item[1], 0.0, 0.0, item[2]) for item in batch_items]
+            
+            # Batch preprocessing
+            batch_list = []
+            for i, (frame_id, frame, pos_ms, x1, y1, x2, y2) in enumerate(valid_items):
+                crop = frame[y1:y2, x1:x2]
+                resized = cv2.resize(crop, (MODEL_SIZE, MODEL_SIZE), interpolation=cv2.INTER_LINEAR)
+                batch_list.append(resized)
+                batch_frames.append(frame)
+                batch_metadata.append((frame_id, frame, pos_ms, resized))
+            
+            # GPU batch inference
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+                
+            results = model.predict(
+                batch_list, 
+                imgsz=MODEL_SIZE, 
+                verbose=False, 
+                conf=self.args.conf,
+                device=f"cuda:{gpu_id}",
+                half=True,  # Use FP16 for speed
+                augment=False,
+            )
+            
+            # Process results
+            batch_results = []
+            result_idx = 0
+            
+            for frame_id, frame, pos_ms, resized_crop in batch_metadata:
+                if resized_crop is None:
+                    batch_results.append((frame_id, frame, 0.0, 0.0, pos_ms))
+                    continue
+                
+                if result_idx < len(results):
+                    r = results[result_idx]
+                    result_idx += 1
+                    
+                    out, half_area, piece_area = self._process_single_result_gpu(
+                        frame, r, HALF_IDS, OBSCURED_IDS, PIECE_IDS, SHELL_IDS, model
+                    )
+                    batch_results.append((frame_id, out, half_area, piece_area, pos_ms))
+                else:
+                    batch_results.append((frame_id, frame, 0.0, 0.0, pos_ms))
+            
+            return batch_results
+            
+        except Exception as e:
+            if "out of memory" in str(e).lower():
+                print(f"GPU {gpu_id} out of memory with batch size {len(batch_items)}. Consider reducing batch size.")
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+            else:
+                print(f"GPU {gpu_id} batch processing failed: {e}")
+            return []
+    
+    def _process_single_result_gpu(self, frame, result, HALF_IDS, OBSCURED_IDS, PIECE_IDS, SHELL_IDS, model):
+        """Process a single inference result on GPU."""
+        # Reuse the existing _process_single_result logic
+        processor = FrameProcessor(model, self.class_config, self.args, 1, 1, 1)
+        return processor._process_single_result(frame, result, HALF_IDS, OBSCURED_IDS, PIECE_IDS, SHELL_IDS)
+    
+    def add_frame(self, frame_id, frame, pos_ms):
+        """Add frame for processing (non-blocking)."""
+        try:
+            self.frame_queue.put((frame_id, frame, pos_ms), block=False)
+            return True
+        except queue.Full:
+            return False
+    
+    def get_result(self, timeout=0.1):
+        """Get processed result (non-blocking)."""
+        try:
+            return self.result_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+
 class FrameProcessor:
     """Multi-threaded frame processor with batch processing for improved GPU utilization."""
     
@@ -1121,6 +1397,8 @@ def main():
                         help="Number of worker threads for parallel processing (default: 2)")
     parser.add_argument("--queue-size", type=int, default=20,
                         help="Maximum queue size for parallel processing (default: 20)")
+    parser.add_argument("--multi-gpu", action="store_true", default=False,
+                        help="Use multi-GPU processing if multiple CUDA devices are available")
     parser.add_argument("--batch-size", type=int, default=0,
                         help="Batch size for GPU inference (default: 0 = auto-detect based on GPU)")
     parser.add_argument("--max-batch-size", type=int, default=256,
@@ -1228,9 +1506,20 @@ def main():
             optimal_batch_size = args.batch_size
             
         class_config = (HALF_IDS, OBSCURED_IDS, PIECE_IDS, SHELL_IDS)
-        processor = FrameProcessor(model, class_config, args, args.queue_size, args.num_workers, optimal_batch_size)
-        processor.start_workers()
-        print(f"Parallel processing enabled: {args.num_workers} workers, batch size: {optimal_batch_size}, queue size: {args.queue_size}")
+        
+        # Check for multi-GPU support
+        gpu_devices = get_gpu_devices()
+        if args.multi_gpu and len(gpu_devices) > 1:
+            print(f"Multi-GPU mode enabled: {len(gpu_devices)} GPUs detected")
+            processor = MultiGPUFrameProcessor(args.model, class_config, args, args.queue_size, optimal_batch_size)
+            processor.start_workers()
+            print(f"Multi-GPU processing started: {len(gpu_devices)} GPU workers, batch size: {optimal_batch_size}")
+        else:
+            if args.multi_gpu and len(gpu_devices) <= 1:
+                print("Multi-GPU requested but only 1 GPU available, falling back to single-GPU mode")
+            processor = FrameProcessor(model, class_config, args, args.queue_size, args.num_workers, optimal_batch_size)
+            processor.start_workers()
+            print(f"Parallel processing enabled: {args.num_workers} workers, batch size: {optimal_batch_size}, queue size: {args.queue_size}")
         
         # GPU-specific optimizations
         if torch and torch.cuda.is_available():
@@ -1238,8 +1527,9 @@ def main():
             # Warm up the GPU
             try:
                 dummy_input = np.zeros((1, MODEL_SIZE, MODEL_SIZE, 3), dtype=np.uint8)
-                model.predict([dummy_input], verbose=False, imgsz=MODEL_SIZE)
-                torch.cuda.empty_cache()
+                _ = model.predict([dummy_input], verbose=False, imgsz=MODEL_SIZE)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 print("GPU warmup complete")
             except Exception as e:
                 print(f"GPU warmup failed: {e}")
