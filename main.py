@@ -871,6 +871,8 @@ class DedicatedGPUPipeline:
                             device=f"cuda:{self.inference_gpu}",
                             half=True,
                             augment=False,
+                            stream=False,  # We want results immediately, not a generator
+                            save=False,    # Don't save predictions
                         )
                     
                     # Process results and send back
