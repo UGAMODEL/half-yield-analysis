@@ -861,10 +861,19 @@ class DedicatedGPUPipeline:
                     if batch_count < 5:  # Debug early batches
                         print(f"GPU {self.inference_gpu} processing batch {batch_id} ({len(batch_frames)} frames)")
                     
-                    # Pure inference on GPU 1
+                    # Pure inference on GPU 1 - Create proper batch tensor for GPU efficiency
                     with torch.cuda.device(self.inference_gpu):
+                        # Convert batch_frames to proper tensor format for efficient GPU utilization
+                        import numpy as np
+                        batch_tensor = np.stack(batch_frames, axis=0)  # Stack into (N, H, W, C) format
+                        
+                        # Monitor memory before batch processing
+                        if batch_count < 3:
+                            memory_before = torch.cuda.memory_allocated(self.inference_gpu) / 1024**3
+                            print(f"GPU {self.inference_gpu} memory before batch: {memory_before:.2f}GB")
+                        
                         results_generator = model.predict(
-                            batch_frames,
+                            batch_tensor,  # Pass full tensor batch instead of list
                             imgsz=MODEL_SIZE,
                             verbose=False,
                             conf=self.args.conf,
@@ -876,6 +885,11 @@ class DedicatedGPUPipeline:
                         )
                         # Convert generator to list to process batch results
                         results = list(results_generator)
+                        
+                        # Monitor memory after batch processing
+                        if batch_count < 3:
+                            memory_after = torch.cuda.memory_allocated(self.inference_gpu) / 1024**3
+                            print(f"GPU {self.inference_gpu} memory after batch: {memory_after:.2f}GB, processed {len(results)} results")
                     
                     # Process results and send back
                     for i, (frame_id, original_frame, pos_ms) in enumerate(batch_metadata):
