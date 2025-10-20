@@ -685,6 +685,267 @@ def save_yield_report(stats, output_path=None, video_path=None):
 
 # ======================= Parallel Processing =======================
 
+class DedicatedGPUPipeline:
+    """
+    Two-GPU pipeline with dedicated roles:
+    - GPU 0: NVDEC decode + preprocessing 
+    - GPU 1: YOLO inference
+    """
+    
+    def __init__(self, model_path, class_config, args, batch_size=512):
+        self.model_path = model_path
+        self.class_config = class_config
+        self.args = args
+        self.batch_size = batch_size
+        
+        # Queues for pipeline communication
+        self.preprocessed_queue = queue.Queue(maxsize=5)   # Smaller queue to prevent memory buildup
+        self.result_queue = queue.Queue(maxsize=100)       # Results back to main thread
+        self.stop_event = threading.Event()
+        
+        # Workers
+        self.decode_worker = None
+        self.inference_worker = None
+        
+        # GPU assignments
+        self.decode_gpu = 0      # GPU 0: Decode + preprocess
+        self.inference_gpu = 1   # GPU 1: Pure inference
+        
+        print("Dedicated GPU Pipeline:")
+        print(f"  GPU {self.decode_gpu}: NVDEC decode + preprocessing")
+        print(f"  GPU {self.inference_gpu}: YOLO inference (batch size: {batch_size})")
+        
+    def start_workers(self, video_capture):
+        """Start the dedicated GPU workers."""
+        # Start inference worker first (needs to load model)
+        self.inference_worker = threading.Thread(
+            target=self._inference_worker_loop,
+            name="GPU1-Inference-Worker"
+        )
+        self.inference_worker.daemon = True
+        self.inference_worker.start()
+        
+        # Give inference worker time to load model
+        import time
+        time.sleep(2)
+        
+        # Start decode worker
+        self.decode_worker = threading.Thread(
+            target=self._decode_worker_loop,
+            args=(video_capture,),
+            name="GPU0-Decode-Worker"
+        )
+        self.decode_worker.daemon = True
+        self.decode_worker.start()
+        
+        print("Dedicated GPU workers started")
+    
+    def stop_workers(self):
+        """Stop all workers."""
+        self.stop_event.set()
+        
+        # Send sentinel to unblock inference worker
+        try:
+            self.preprocessed_queue.put(None, timeout=1.0)
+        except queue.Full:
+            pass
+            
+        # Wait for workers
+        if self.decode_worker:
+            self.decode_worker.join(timeout=5.0)
+        if self.inference_worker:
+            self.inference_worker.join(timeout=5.0)
+    
+    def _decode_worker_loop(self, cap):
+        """GPU 0: Dedicated decode and preprocessing worker."""
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.set_device(self.decode_gpu)
+                torch.cuda.empty_cache()
+            print(f"GPU {self.decode_gpu} decode worker started")
+            
+            frame_id = 0
+            batch_frames = []
+            batch_metadata = []
+            batch_count = 0
+            
+            while not self.stop_event.is_set():
+                try:
+                    # Read frame with NVDEC
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    
+                    pos_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+                    
+                    # Preprocess frame
+                    processed_frame = self._preprocess_frame(frame)
+                    if processed_frame is not None:
+                        batch_frames.append(processed_frame)
+                        batch_metadata.append((frame_id, frame, pos_ms))
+                    
+                    frame_id += 1
+                    
+                    # When batch is ready, send to inference GPU
+                    if len(batch_frames) >= self.batch_size:
+                        batch_data = {
+                            'frames': batch_frames,
+                            'metadata': batch_metadata,
+                            'batch_id': batch_count
+                        }
+                        
+                        try:
+                            self.preprocessed_queue.put(batch_data, timeout=0.5)
+                            if batch_count < 5:  # Debug early batches
+                                print(f"GPU {self.decode_gpu} → batch {batch_count} ({len(batch_frames)} frames) → GPU {self.inference_gpu}")
+                            batch_frames = []
+                            batch_metadata = []
+                            batch_count += 1
+                        except queue.Full:
+                            # Drop oldest batch and try again
+                            print(f"GPU {self.decode_gpu} queue full, dropping batch {batch_count}")
+                            batch_frames = []
+                            batch_metadata = []
+                
+                except Exception as e:
+                    print(f"GPU {self.decode_gpu} decode error: {e}")
+                    continue
+            
+            # Send final partial batch
+            if batch_frames:
+                batch_data = {
+                    'frames': batch_frames,
+                    'metadata': batch_metadata,
+                    'batch_id': batch_count
+                }
+                try:
+                    self.preprocessed_queue.put(batch_data, timeout=1.0)
+                    print(f"GPU {self.decode_gpu} sent final batch ({len(batch_frames)} frames)")
+                except queue.Full:
+                    pass
+                    
+        except Exception as e:
+            print(f"GPU {self.decode_gpu} decode worker failed: {e}")
+    
+    def _inference_worker_loop(self):
+        """GPU 1: Dedicated inference worker."""
+        try:
+            import torch
+            from ultralytics import YOLO
+            
+            # Load model on inference GPU
+            if torch.cuda.is_available():
+                torch.cuda.set_device(self.inference_gpu)
+            model = YOLO(self.model_path)
+            model.to(f"cuda:{self.inference_gpu}")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            print(f"GPU {self.inference_gpu} inference worker ready")
+            
+            HALF_IDS, OBSCURED_IDS, PIECE_IDS, SHELL_IDS = self.class_config
+            batch_count = 0
+            
+            while not self.stop_event.is_set():
+                try:
+                    # Get preprocessed batch from GPU 0
+                    batch_data = self.preprocessed_queue.get(timeout=2.0)
+                    if batch_data is None:  # Sentinel
+                        break
+                    
+                    batch_frames = batch_data['frames']
+                    batch_metadata = batch_data['metadata']
+                    batch_id = batch_data['batch_id']
+                    
+                    if batch_count < 5:  # Debug early batches
+                        print(f"GPU {self.inference_gpu} processing batch {batch_id} ({len(batch_frames)} frames)")
+                    
+                    # Pure inference on GPU 1
+                    with torch.cuda.device(self.inference_gpu):
+                        results = model.predict(
+                            batch_frames,
+                            imgsz=MODEL_SIZE,
+                            verbose=False,
+                            conf=self.args.conf,
+                            device=f"cuda:{self.inference_gpu}",
+                            half=True,
+                            augment=False,
+                        )
+                    
+                    # Process results and send back
+                    for i, (frame_id, original_frame, pos_ms) in enumerate(batch_metadata):
+                        if i < len(results):
+                            result = results[i]
+                            processed_frame, half_area, piece_area = self._process_result(
+                                original_frame, result, HALF_IDS, OBSCURED_IDS, PIECE_IDS, SHELL_IDS
+                            )
+                            
+                            result_data = (frame_id, processed_frame, half_area, piece_area, pos_ms)
+                            try:
+                                self.result_queue.put(result_data, timeout=0.1)
+                            except queue.Full:
+                                break  # Skip if result queue full
+                    
+                    batch_count += 1
+                    if batch_count < 5:
+                        print(f"GPU {self.inference_gpu} completed batch {batch_id}")
+                        
+                except queue.Empty:
+                    continue
+                except Exception as e:
+                    print(f"GPU {self.inference_gpu} inference error: {e}")
+                    continue
+                    
+        except Exception as e:
+            print(f"GPU {self.inference_gpu} inference worker failed: {e}")
+    
+    def _preprocess_frame(self, frame):
+        """Preprocess frame for inference."""
+        try:
+            H, W = frame.shape[:2]
+            x1, y1 = ROI_X, ROI_Y
+            x2, y2 = min(ROI_X + ROI_W, W), min(ROI_Y + ROI_H, H)
+            
+            if x1 >= x2 or y1 >= y2:
+                return None
+            
+            crop = frame[y1:y2, x1:x2]
+            resized = cv2.resize(crop, (MODEL_SIZE, MODEL_SIZE), interpolation=cv2.INTER_LINEAR)
+            return resized
+            
+        except Exception:
+            return None
+    
+    def _process_result(self, frame, result, HALF_IDS, OBSCURED_IDS, PIECE_IDS, SHELL_IDS):
+        """Process inference result using existing logic."""
+        try:
+            # Use existing result processing logic from FrameProcessor
+            out, half_area_sum, piece_area_sum = result, 0.0, 0.0
+            
+            # Simple processing - extract areas from result
+            if hasattr(result, 'masks') and result.masks is not None:
+                masks = result.masks.data.cpu().numpy()
+                classes = result.boxes.cls.cpu().numpy() if result.boxes is not None else []
+                
+                for i, (mask, cls) in enumerate(zip(masks, classes)):
+                    if int(cls) in HALF_IDS:
+                        half_area_sum += mask.sum()
+                    elif int(cls) in PIECE_IDS:
+                        piece_area_sum += mask.sum()
+            
+            return frame, half_area_sum, piece_area_sum
+        except Exception as e:
+            return frame, 0.0, 0.0
+    
+    def get_result(self, timeout=0.1):
+        """Get processed result."""
+        try:
+            return self.result_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+
 class MultiGPUFrameProcessor:
     """Multi-GPU frame processor for maximum throughput on dual GPU systems."""
     
@@ -1499,6 +1760,65 @@ def process_frame(
 
 # ======================= Main =======================
 
+def run_dedicated_gpu_processing(processor, args, total_frames, fps):
+    """Run dedicated GPU processing loop."""
+    try:
+        frame_count = 0
+        last_progress_update = 0
+        progress_update_interval = max(1, total_frames // 100)
+        
+        print("Starting dedicated GPU processing...")
+        
+        while True:
+            # Get results from dedicated pipeline
+            result = processor.get_result(timeout=0.1)
+            if result is None:
+                # Check if decode worker is done
+                if not processor.decode_worker.is_alive():
+                    # Wait a bit more for remaining results
+                    remaining_results = 0
+                    while remaining_results < 100:  # Max wait for stragglers
+                        result = processor.get_result(timeout=0.1)
+                        if result is None:
+                            remaining_results += 1
+                            continue
+                        else:
+                            remaining_results = 0
+                            # Process result normally
+                            frame_count += 1
+                            
+                            # Update progress
+                            if (frame_count - last_progress_update) >= progress_update_interval:
+                                progress = (frame_count / total_frames) * 100 if total_frames > 0 else 0
+                                bar_width = 40
+                                filled = int(bar_width * progress / 100)
+                                bar = '█' * filled + '░' * (bar_width - filled)
+                                print(f"\rProcessing: [{bar}] {progress:.1f}% "
+                                      f"(Frame {frame_count}/{total_frames})", end='', flush=True)
+                                last_progress_update = frame_count
+                    break
+                continue
+            
+            frame_id, out, half_area, piece_area, pos_ms = result
+            frame_count += 1
+            
+            # Update progress
+            if (frame_count - last_progress_update) >= progress_update_interval:
+                progress = (frame_count / total_frames) * 100 if total_frames > 0 else 0
+                bar_width = 40
+                filled = int(bar_width * progress / 100)
+                bar = '█' * filled + '░' * (bar_width - filled)
+                print(f"\rProcessing: [{bar}] {progress:.1f}% "
+                      f"(Frame {frame_count}/{total_frames})", end='', flush=True)
+                last_progress_update = frame_count
+        
+        print(f"\nDedicated GPU processing completed: {frame_count} frames")
+        return frame_count
+        
+    finally:
+        processor.stop_workers()
+
+
 def main():
     parser = argparse.ArgumentParser(description="YOLOv12n-seg contour tracking with integrated ratio chart and per-class thresholds.")
     parser.add_argument("--source", required=True, help="Path to input video file.")
@@ -1550,6 +1870,8 @@ def main():
                         help="Maximum queue size for parallel processing (default: 20)")
     parser.add_argument("--multi-gpu", action="store_true", default=False,
                         help="Use multi-GPU processing if multiple CUDA devices are available")
+    parser.add_argument("--dedicated-gpu", action="store_true", default=False,
+                        help="Use dedicated GPU roles: GPU0=decode, GPU1=inference (requires 2+ GPUs)")
     parser.add_argument("--batch-size", type=int, default=0,
                         help="Batch size for GPU inference (default: 0 = auto-detect based on GPU)")
     parser.add_argument("--max-batch-size", type=int, default=256,
@@ -1670,19 +1992,37 @@ def main():
         
         if will_use_multi_gpu:
             print(f"Multi-GPU mode enabled: {len(gpu_devices)} GPUs detected")
-            # For multi-GPU, each GPU can use larger batches since memory is separate
-            # Increase batch size for multi-GPU: each GPU gets its own optimal batch size
-            if args.batch_size == 0:
-                multi_gpu_batch_size = optimal_batch_size  # Each GPU uses full optimal batch
-                print(f"Multi-GPU: Each GPU will use batch size {multi_gpu_batch_size} (total capacity: {multi_gpu_batch_size * len(gpu_devices)})")
-            else:
-                multi_gpu_batch_size = args.batch_size
             
-            # Increase queue size for multi-GPU to allow larger batches
-            multi_gpu_queue_size = max(args.queue_size, len(gpu_devices) * multi_gpu_batch_size + 100)
-            processor = MultiGPUFrameProcessor(args.model, class_config, args, multi_gpu_queue_size, multi_gpu_batch_size)
-            processor.start_workers()
-            print(f"Multi-GPU processing started: {len(gpu_devices)} GPU workers, batch size: {multi_gpu_batch_size}, queue size: {multi_gpu_queue_size}")
+            # Check for dedicated GPU mode
+            if args.dedicated_gpu and len(gpu_devices) >= 2:
+                print("Using dedicated GPU pipeline: GPU0=decode, GPU1=inference")
+                # For dedicated mode, use larger batch sizes since GPU1 is purely for inference
+                if args.batch_size == 0:
+                    dedicated_batch_size = min(1024, args.max_batch_size)  # Larger batches for dedicated inference
+                else:
+                    dedicated_batch_size = args.batch_size
+                    
+                processor = DedicatedGPUPipeline(args.model, class_config, args, dedicated_batch_size)
+                processor.start_workers(cap)
+                print(f"Dedicated GPU processing started: batch size {dedicated_batch_size}")
+                
+                # Use dedicated GPU result loop
+                return run_dedicated_gpu_processing(processor, args, total_frames, fps)
+            else:
+                # Regular multi-GPU mode (load balancing)
+                # For multi-GPU, each GPU can use larger batches since memory is separate
+                # Increase batch size for multi-GPU: each GPU gets its own optimal batch size
+                if args.batch_size == 0:
+                    multi_gpu_batch_size = optimal_batch_size  # Each GPU uses full optimal batch
+                    print(f"Multi-GPU: Each GPU will use batch size {multi_gpu_batch_size} (total capacity: {multi_gpu_batch_size * len(gpu_devices)})")
+                else:
+                    multi_gpu_batch_size = args.batch_size
+                
+                # Increase queue size for multi-GPU to allow larger batches
+                multi_gpu_queue_size = max(args.queue_size, len(gpu_devices) * multi_gpu_batch_size + 100)
+                processor = MultiGPUFrameProcessor(args.model, class_config, args, multi_gpu_queue_size, multi_gpu_batch_size)
+                processor.start_workers()
+                print(f"Multi-GPU processing started: {len(gpu_devices)} GPU workers, batch size: {multi_gpu_batch_size}, queue size: {multi_gpu_queue_size}")
         else:
             if args.multi_gpu and len(gpu_devices) <= 1:
                 print("Multi-GPU requested but only 1 GPU available, falling back to single-GPU mode")
