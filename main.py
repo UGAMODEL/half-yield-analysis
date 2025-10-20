@@ -1974,7 +1974,7 @@ def main():
     if args.parallel and not args.show:
         # Check if multi-GPU mode will be used
         gpu_devices = get_gpu_devices()
-        will_use_multi_gpu = args.multi_gpu and len(gpu_devices) > 1
+        will_use_multi_gpu = (args.multi_gpu or args.dedicated_gpu) and len(gpu_devices) > 1
         
         # Auto-detect optimal batch size with multi-GPU awareness
         if args.batch_size == 0:
@@ -1987,42 +1987,39 @@ def main():
             
         class_config = (HALF_IDS, OBSCURED_IDS, PIECE_IDS, SHELL_IDS)
         
-        # Check for multi-GPU support
-        multi_gpu_queue_size = args.queue_size  # Default to normal queue size
-        
-        if will_use_multi_gpu:
-            print(f"Multi-GPU mode enabled: {len(gpu_devices)} GPUs detected")
-            
-            # Check for dedicated GPU mode
-            if args.dedicated_gpu and len(gpu_devices) >= 2:
-                print("Using dedicated GPU pipeline: GPU0=decode, GPU1=inference")
-                # For dedicated mode, use larger batch sizes since GPU1 is purely for inference
-                if args.batch_size == 0:
-                    dedicated_batch_size = min(1024, args.max_batch_size)  # Larger batches for dedicated inference
-                else:
-                    dedicated_batch_size = args.batch_size
-                    
-                processor = DedicatedGPUPipeline(args.model, class_config, args, dedicated_batch_size)
-                processor.start_workers(cap)
-                print(f"Dedicated GPU processing started: batch size {dedicated_batch_size}")
-                
-                # Use dedicated GPU result loop
-                return run_dedicated_gpu_processing(processor, args, total_frames, fps)
+        # Check for dedicated GPU mode FIRST
+        if args.dedicated_gpu and len(gpu_devices) >= 2:
+            print("Using dedicated GPU pipeline: GPU0=decode, GPU1=inference")
+            # For dedicated mode, use larger batch sizes since GPU1 is purely for inference
+            if args.batch_size == 0:
+                dedicated_batch_size = min(1024, args.max_batch_size)  # Larger batches for dedicated inference
             else:
-                # Regular multi-GPU mode (load balancing)
-                # For multi-GPU, each GPU can use larger batches since memory is separate
-                # Increase batch size for multi-GPU: each GPU gets its own optimal batch size
-                if args.batch_size == 0:
-                    multi_gpu_batch_size = optimal_batch_size  # Each GPU uses full optimal batch
-                    print(f"Multi-GPU: Each GPU will use batch size {multi_gpu_batch_size} (total capacity: {multi_gpu_batch_size * len(gpu_devices)})")
-                else:
-                    multi_gpu_batch_size = args.batch_size
+                dedicated_batch_size = args.batch_size
                 
-                # Increase queue size for multi-GPU to allow larger batches
-                multi_gpu_queue_size = max(args.queue_size, len(gpu_devices) * multi_gpu_batch_size + 100)
-                processor = MultiGPUFrameProcessor(args.model, class_config, args, multi_gpu_queue_size, multi_gpu_batch_size)
-                processor.start_workers()
-                print(f"Multi-GPU processing started: {len(gpu_devices)} GPU workers, batch size: {multi_gpu_batch_size}, queue size: {multi_gpu_queue_size}")
+            processor = DedicatedGPUPipeline(args.model, class_config, args, dedicated_batch_size)
+            processor.start_workers(cap)
+            print(f"Dedicated GPU processing started: batch size {dedicated_batch_size}")
+            
+            # Use dedicated GPU result loop
+            return run_dedicated_gpu_processing(processor, args, total_frames, fps)
+        
+        # Check for multi-GPU support (regular load balancing)        
+        if will_use_multi_gpu and args.multi_gpu:  # Only for regular multi-GPU, not dedicated
+            print(f"Multi-GPU mode enabled: {len(gpu_devices)} GPUs detected")
+            # Regular multi-GPU mode (load balancing)
+            # For multi-GPU, each GPU can use larger batches since memory is separate
+            # Increase batch size for multi-GPU: each GPU gets its own optimal batch size
+            if args.batch_size == 0:
+                multi_gpu_batch_size = optimal_batch_size  # Each GPU uses full optimal batch
+                print(f"Multi-GPU: Each GPU will use batch size {multi_gpu_batch_size} (total capacity: {multi_gpu_batch_size * len(gpu_devices)})")
+            else:
+                multi_gpu_batch_size = args.batch_size
+            
+            # Increase queue size for multi-GPU to allow larger batches
+            multi_gpu_queue_size = max(args.queue_size, len(gpu_devices) * multi_gpu_batch_size + 100)
+            processor = MultiGPUFrameProcessor(args.model, class_config, args, multi_gpu_queue_size, multi_gpu_batch_size)
+            processor.start_workers()
+            print(f"Multi-GPU processing started: {len(gpu_devices)} GPU workers, batch size: {multi_gpu_batch_size}, queue size: {multi_gpu_queue_size}")
         else:
             if args.multi_gpu and len(gpu_devices) <= 1:
                 print("Multi-GPU requested but only 1 GPU available, falling back to single-GPU mode")
@@ -2033,18 +2030,18 @@ def main():
         # GPU-specific optimizations
         if torch and torch.cuda.is_available():
             print("GPU optimizations enabled: FP16 precision, memory management")
-            # Warm up the GPU - skip for multi-GPU as each worker handles its own warmup
-            if not (args.multi_gpu and len(gpu_devices) > 1):
+            # Skip warmup for dedicated GPU as each worker handles its own warmup
+            if not (args.dedicated_gpu and len(gpu_devices) >= 2):
                 try:
                     dummy_input = np.zeros((1, MODEL_SIZE, MODEL_SIZE, 3), dtype=np.uint8)
-                    _ = model.predict([dummy_input], verbose=False, imgsz=MODEL_SIZE)
+                    warmup_result = model.predict([dummy_input], verbose=False, imgsz=MODEL_SIZE)
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                     print("GPU warmup complete")
                 except Exception as e:
                     print(f"GPU warmup failed: {e}")
             else:
-                print("Multi-GPU mode: individual GPU warmup handled by workers")
+                print("Dedicated GPU mode: individual GPU warmup handled by workers")
 
     try:
         if processor is not None:
