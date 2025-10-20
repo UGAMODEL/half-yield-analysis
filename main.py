@@ -756,8 +756,14 @@ class MultiGPUFrameProcessor:
                 # Collect frames with timeout to avoid hanging
                 for i in range(self.batch_size):
                     try:
-                        # Use shorter timeout for first frame, longer for subsequent
-                        timeout = 1.0 if i == 0 else 0.1
+                        # Use longer timeout for larger batches, shorter for small batches
+                        if i < 32:  # Wait longer for first 32 frames to build up batch
+                            timeout = 0.5
+                        elif i < 64:  # Medium wait for next 32
+                            timeout = 0.2
+                        else:  # Quick collection for remaining frames
+                            timeout = 0.1
+                            
                         item = frame_queue.get(timeout=timeout)
                         if item is None:  # Sentinel value
                             if batch_items:
@@ -772,15 +778,18 @@ class MultiGPUFrameProcessor:
                             print(f"GPU {gpu_id} got first frame {batch_items[0][0]}")
                             
                     except queue.Empty:
-                        if batch_items:
-                            # Process partial batch if we have some frames
-                            print(f"GPU {gpu_id} processing partial batch of {len(batch_items)} frames")
+                        if len(batch_items) >= 32:  # Only process if we have a decent batch size
+                            print(f"GPU {gpu_id} processing batch of {len(batch_items)} frames")
                             break
                         elif i == 0:
-                            # No frames available, continue waiting
+                            # No frames available at all, continue waiting
+                            continue
+                        elif len(batch_items) < 8:
+                            # Very small batch, keep trying to collect more
                             continue
                         else:
-                            # Got some frames but timed out getting more
+                            # Got some frames but not ideal, process anyway
+                            print(f"GPU {gpu_id} processing small batch of {len(batch_items)} frames")
                             break
                 
                 if not batch_items:
@@ -1550,11 +1559,15 @@ def main():
         
         # Check for multi-GPU support
         gpu_devices = get_gpu_devices()
+        multi_gpu_queue_size = args.queue_size  # Default to normal queue size
+        
         if args.multi_gpu and len(gpu_devices) > 1:
             print(f"Multi-GPU mode enabled: {len(gpu_devices)} GPUs detected")
-            processor = MultiGPUFrameProcessor(args.model, class_config, args, args.queue_size, optimal_batch_size)
+            # Increase queue size for multi-GPU to allow larger batches
+            multi_gpu_queue_size = max(args.queue_size, len(gpu_devices) * optimal_batch_size + 100)
+            processor = MultiGPUFrameProcessor(args.model, class_config, args, multi_gpu_queue_size, optimal_batch_size)
             processor.start_workers()
-            print(f"Multi-GPU processing started: {len(gpu_devices)} GPU workers, batch size: {optimal_batch_size}")
+            print(f"Multi-GPU processing started: {len(gpu_devices)} GPU workers, batch size: {optimal_batch_size}, queue size: {multi_gpu_queue_size}")
         else:
             if args.multi_gpu and len(gpu_devices) <= 1:
                 print("Multi-GPU requested but only 1 GPU available, falling back to single-GPU mode")
@@ -1585,9 +1598,19 @@ def main():
             next_frame_id = 0
             ret = True  # Initialize ret
             
+            # Use larger queue size for multi-GPU processors
+            if hasattr(processor, 'frame_queues'):
+                # Multi-GPU processor - use much larger queue (2 GPUs × 256 batch × 2 + buffer)
+                effective_queue_size = 2 * 256 * 2 + 50  # ~1074 frames
+                print(f"Multi-GPU mode: using large queue size: {effective_queue_size}")
+            else:
+                # Single GPU processor - use normal queue size
+                effective_queue_size = args.queue_size
+                print(f"Single-GPU mode: using queue size: {effective_queue_size}")
+            
             while True:
                 # Read and queue frames
-                while len(pending_results) < args.queue_size:
+                while len(pending_results) < effective_queue_size:
                     ret, frame = cap.read()
                     if not ret:
                         break
