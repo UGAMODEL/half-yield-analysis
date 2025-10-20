@@ -692,15 +692,15 @@ class DedicatedGPUPipeline:
     - GPU 1: YOLO inference
     """
     
-    def __init__(self, model_path, class_config, args, batch_size=256):
+    def __init__(self, model_path, class_config, args, batch_size=128):
         self.model_path = model_path
         self.class_config = class_config
         self.args = args
         self.batch_size = batch_size  # This is the max batch size for streaming
         
-        # Queues for pipeline communication
-        self.preprocessed_queue = queue.Queue(maxsize=20)  # Larger queue to handle decode/inference speed mismatch
-        self.result_queue = queue.Queue(maxsize=200)       # Results back to main thread
+        # Optimized queues for high throughput
+        self.preprocessed_queue = queue.Queue(maxsize=30)  # Larger queue for better buffering
+        self.result_queue = queue.Queue(maxsize=300)       # Larger result buffer
         self.stop_event = threading.Event()
         
         # Workers
@@ -711,7 +711,7 @@ class DedicatedGPUPipeline:
         self.decode_gpu = 0      # GPU 0: Decode + preprocess
         self.inference_gpu = 1   # GPU 1: Pure inference
         
-        print("Dedicated GPU Pipeline (Streaming Mode):")
+        print("Dedicated GPU Pipeline (High-Throughput Streaming Mode):")
         print(f"  GPU {self.decode_gpu}: NVDEC decode + preprocessing")
         print(f"  GPU {self.inference_gpu}: YOLO inference (streaming batches, max size: {batch_size})")
         
@@ -770,11 +770,15 @@ class DedicatedGPUPipeline:
             batch_metadata = []
             batch_count = 0
             
-            # Streaming batch parameters - send smaller batches more frequently
-            min_batch_size = 64    # Minimum batch for efficiency
-            max_batch_size = 256   # Maximum batch before forcing send
-            send_timeout_frames = 32  # Send batch after this many frames even if small
+            # Streaming batch parameters - optimized for continuous throughput
+            min_batch_size = 32    # Smaller minimum for faster sending
+            max_batch_size = 128   # Smaller max to reduce assembly time
+            send_timeout_frames = 16  # Send more frequently
             frames_since_send = 0
+            
+            # Pre-allocate batch storage
+            batch_frames = []
+            batch_metadata = []
             
             while not self.stop_event.is_set():
                 try:
@@ -794,11 +798,12 @@ class DedicatedGPUPipeline:
                     frame_id += 1
                     frames_since_send += 1
                     
-                    # Streaming batch logic - send when we have enough OR timeout
+                    # Optimized streaming batch logic - send more aggressively
                     should_send = (
                         len(batch_frames) >= max_batch_size or  # Hit max batch size
                         (len(batch_frames) >= min_batch_size and frames_since_send >= send_timeout_frames) or  # Good size + timeout
-                        (frames_since_send >= send_timeout_frames * 2 and len(batch_frames) > 0)  # Force send with any frames
+                        (frames_since_send >= send_timeout_frames and len(batch_frames) > 0) or  # Force send with any frames
+                        (len(batch_frames) >= 16 and frames_since_send >= 8)  # Quick send for small batches
                     )
                     
                     if should_send:
@@ -813,14 +818,16 @@ class DedicatedGPUPipeline:
                         try:
                             # Use non-blocking put to avoid stalling decode
                             self.preprocessed_queue.put(batch_data, block=False)
-                            print(f"GPU {self.decode_gpu} → batch {batch_count} ({len(batch_frames)} frames) → GPU {self.inference_gpu} SUCCESS")
+                            if batch_count % 10 == 0:  # Only print every 10th batch to reduce I/O overhead
+                                print(f"GPU {self.decode_gpu} → batch {batch_count} ({len(batch_frames)} frames) → GPU {self.inference_gpu} SUCCESS")
                             batch_frames = []
                             batch_metadata = []
                             batch_count += 1
                             frames_since_send = 0
                         except queue.Full:
                             # If queue is full, inference is behind - continue decoding but drop this batch
-                            print(f"GPU {self.decode_gpu} queue full, dropping batch {batch_count} ({len(batch_frames)} frames)")
+                            if batch_count % 10 == 0:  # Only print drops occasionally
+                                print(f"GPU {self.decode_gpu} queue full, dropping batch {batch_count} ({len(batch_frames)} frames)")
                             batch_frames = []
                             batch_metadata = []
                             frames_since_send = 0
@@ -866,7 +873,8 @@ class DedicatedGPUPipeline:
             
             while not self.stop_event.is_set():
                 try:
-                    print(f"GPU {self.inference_gpu} waiting for batch data...")
+                    if batch_count % 10 == 0:  # Reduce debug frequency
+                        print(f"GPU {self.inference_gpu} waiting for batch data...")
                     
                     # Get preprocessed batch from GPU 0
                     batch_data = self.preprocessed_queue.get(timeout=2.0)
@@ -878,31 +886,35 @@ class DedicatedGPUPipeline:
                     batch_metadata = batch_data['metadata']
                     batch_id = batch_data['batch_id']
                     
-                    print(f"GPU {self.inference_gpu} received batch {batch_id} with {len(batch_frames)} frames")
+                    if batch_count % 20 == 0:  # Even less frequent debug
+                        print(f"GPU {self.inference_gpu} received batch {batch_id} with {len(batch_frames)} frames")
                     
                     # Validate batch data
                     if not batch_frames:
                         print(f"GPU {self.inference_gpu} received empty batch {batch_id}")
                         continue
                         
-                    # Check first frame format
-                    first_frame = batch_frames[0]
-                    print(f"GPU {self.inference_gpu} first frame shape: {first_frame.shape}, dtype: {first_frame.dtype}")
+                    # Check first frame format (only occasionally)
+                    if batch_count % 50 == 0:
+                        first_frame = batch_frames[0]
+                        print(f"GPU {self.inference_gpu} first frame shape: {first_frame.shape}, dtype: {first_frame.dtype}")
                     
                     # Pure inference on GPU 1 - Create proper batch tensor for GPU efficiency
                     with torch.cuda.device(self.inference_gpu):
-                        # Monitor memory before batch processing
-                        memory_before = torch.cuda.memory_allocated(self.inference_gpu) / 1024**3
-                        print(f"GPU {self.inference_gpu} memory before batch: {memory_before:.2f}GB")
+                        # Monitor memory before batch processing (less frequently)
+                        if batch_count % 100 == 0:
+                            memory_before = torch.cuda.memory_allocated(self.inference_gpu) / 1024**3
+                            print(f"GPU {self.inference_gpu} memory before batch: {memory_before:.2f}GB")
                         
-                        print(f"GPU {self.inference_gpu} starting model.predict() for batch {batch_id}")
+                        if batch_count % 50 == 0:
+                            print(f"GPU {self.inference_gpu} starting model.predict() for batch {batch_id}")
                         
                         # Use batch_frames directly - they are already preprocessed images
                         # YOLO expects a list of numpy arrays (H, W, C) format
                         results_generator = model.predict(
                             batch_frames,  # Pass list of preprocessed images directly
                             imgsz=MODEL_SIZE,
-                            verbose=True,  # Enable verbose to see YOLO output
+                            verbose=False,  # Disable verbose for production
                             conf=self.args.conf,
                             device=f"cuda:{self.inference_gpu}",
                             half=True,
@@ -911,17 +923,21 @@ class DedicatedGPUPipeline:
                             save=False,    # Don't save predictions
                         )
                         
-                        print(f"GPU {self.inference_gpu} got results generator, converting to list...")
+                        if batch_count % 50 == 0:
+                            print(f"GPU {self.inference_gpu} got results generator, converting to list...")
                         # Convert generator to list to process batch results
                         results = list(results_generator)
-                        print(f"GPU {self.inference_gpu} converted {len(results)} results from generator")
+                        if batch_count % 50 == 0:
+                            print(f"GPU {self.inference_gpu} converted {len(results)} results from generator")
                         
-                        # Monitor memory after batch processing
-                        memory_after = torch.cuda.memory_allocated(self.inference_gpu) / 1024**3
-                        print(f"GPU {self.inference_gpu} memory after batch: {memory_after:.2f}GB, processed {len(results)} results")
+                        # Monitor memory after batch processing (less frequently)
+                        if batch_count % 100 == 0:
+                            memory_after = torch.cuda.memory_allocated(self.inference_gpu) / 1024**3
+                            print(f"GPU {self.inference_gpu} memory after batch: {memory_after:.2f}GB, processed {len(results)} results")
                     
                     # Process results and send back
-                    print(f"GPU {self.inference_gpu} processing {len(batch_metadata)} metadata items")
+                    if batch_count % 50 == 0:
+                        print(f"GPU {self.inference_gpu} processing {len(batch_metadata)} metadata items")
                     results_sent = 0
                     for i, (frame_id, original_frame, pos_ms) in enumerate(batch_metadata):
                         if i < len(results):
@@ -935,11 +951,13 @@ class DedicatedGPUPipeline:
                                 self.result_queue.put(result_data, timeout=0.1)
                                 results_sent += 1
                             except queue.Full:
-                                print(f"GPU {self.inference_gpu} result queue full after {results_sent} results")
+                                if batch_count % 20 == 0:
+                                    print(f"GPU {self.inference_gpu} result queue full after {results_sent} results")
                                 break  # Skip if result queue full
                     
                     batch_count += 1
-                    print(f"GPU {self.inference_gpu} completed batch {batch_id}, sent {results_sent} results")
+                    if batch_count % 20 == 0:
+                        print(f"GPU {self.inference_gpu} completed batch {batch_id}, sent {results_sent} results")
                         
                 except queue.Empty:
                     print(f"GPU {self.inference_gpu} timeout waiting for batch data")
@@ -2045,15 +2063,15 @@ def main():
         # Check for dedicated GPU mode FIRST
         if args.dedicated_gpu and len(gpu_devices) >= 2:
             print("Using dedicated GPU pipeline: GPU0=decode, GPU1=inference")
-            # For dedicated streaming mode, use smaller batches that send continuously
+            # For dedicated streaming mode, use smaller batches for higher throughput
             if args.batch_size == 0:
-                streaming_batch_size = min(256, args.max_batch_size)  # Streaming batches for better throughput
+                streaming_batch_size = min(128, args.max_batch_size)  # Smaller batches for better streaming
             else:
-                streaming_batch_size = min(args.batch_size, 256)  # Cap user-specified batch size for streaming
+                streaming_batch_size = min(args.batch_size, 128)  # Cap at 128 for optimal streaming
                 
             processor = DedicatedGPUPipeline(args.model, class_config, args, streaming_batch_size)
             processor.start_workers(cap)
-            print(f"Dedicated GPU streaming started: max batch size {streaming_batch_size}")
+            print(f"Dedicated GPU high-throughput streaming started: max batch size {streaming_batch_size}")
             
             # Use dedicated GPU result loop
             return run_dedicated_gpu_processing(processor, args, total_frames, fps)
