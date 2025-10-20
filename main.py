@@ -863,17 +863,15 @@ class DedicatedGPUPipeline:
                     
                     # Pure inference on GPU 1 - Create proper batch tensor for GPU efficiency
                     with torch.cuda.device(self.inference_gpu):
-                        # Convert batch_frames to proper tensor format for efficient GPU utilization
-                        import numpy as np
-                        batch_tensor = np.stack(batch_frames, axis=0)  # Stack into (N, H, W, C) format
-                        
                         # Monitor memory before batch processing
                         if batch_count < 3:
                             memory_before = torch.cuda.memory_allocated(self.inference_gpu) / 1024**3
                             print(f"GPU {self.inference_gpu} memory before batch: {memory_before:.2f}GB")
                         
+                        # Use batch_frames directly - they are already preprocessed images
+                        # YOLO expects a list of numpy arrays (H, W, C) format
                         results_generator = model.predict(
-                            batch_tensor,  # Pass full tensor batch instead of list
+                            batch_frames,  # Pass list of preprocessed images directly
                             imgsz=MODEL_SIZE,
                             verbose=False,
                             conf=self.args.conf,
