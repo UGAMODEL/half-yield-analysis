@@ -697,6 +697,7 @@ class DedicatedGPUPipeline:
         self.class_config = class_config
         self.args = args
         self.batch_size = batch_size  # This is the max batch size for streaming
+        self.debug = args.debug  # Store debug flag
         
         # Optimized queues for high throughput
         self.preprocessed_queue = queue.Queue(maxsize=30)  # Larger queue for better buffering
@@ -813,12 +814,13 @@ class DedicatedGPUPipeline:
                             'batch_id': batch_count
                         }
                         
-                        print(f"GPU {self.decode_gpu} attempting to send batch {batch_count} with {len(batch_frames)} frames (queue size: {self.preprocessed_queue.qsize()})")
+                        if self.debug:  # Only show detailed attempt logs in debug mode
+                            print(f"GPU {self.decode_gpu} attempting to send batch {batch_count} with {len(batch_frames)} frames (queue size: {self.preprocessed_queue.qsize()})")
                         
                         try:
-                            # Use non-blocking put to avoid stalling decode
-                            self.preprocessed_queue.put(batch_data, block=False)
-                            if batch_count % 10 == 0:  # Only print every 10th batch to reduce I/O overhead
+                            # Use short timeout instead of non-blocking to reduce drops
+                            self.preprocessed_queue.put(batch_data, timeout=0.05)
+                            if self.debug and batch_count % 10 == 0:  # Only print in debug mode
                                 print(f"GPU {self.decode_gpu} → batch {batch_count} ({len(batch_frames)} frames) → GPU {self.inference_gpu} SUCCESS")
                             batch_frames = []
                             batch_metadata = []
@@ -826,14 +828,15 @@ class DedicatedGPUPipeline:
                             frames_since_send = 0
                         except queue.Full:
                             # If queue is full, inference is behind - continue decoding but drop this batch
-                            if batch_count % 10 == 0:  # Only print drops occasionally
+                            if self.debug and batch_count % 20 == 0:  # Print drops less frequently in debug mode only
                                 print(f"GPU {self.decode_gpu} queue full, dropping batch {batch_count} ({len(batch_frames)} frames)")
                             batch_frames = []
                             batch_metadata = []
                             frames_since_send = 0
                 
                 except Exception as e:
-                    print(f"GPU {self.decode_gpu} decode error: {e}")
+                    if self.debug:
+                        print(f"GPU {self.decode_gpu} decode error: {e}")
                     continue
             
             # Send final partial batch
@@ -873,7 +876,7 @@ class DedicatedGPUPipeline:
             
             while not self.stop_event.is_set():
                 try:
-                    if batch_count % 10 == 0:  # Reduce debug frequency
+                    if self.debug and batch_count % 10 == 0:  # Reduce debug frequency
                         print(f"GPU {self.inference_gpu} waiting for batch data...")
                     
                     # Get preprocessed batch from GPU 0
@@ -886,7 +889,7 @@ class DedicatedGPUPipeline:
                     batch_metadata = batch_data['metadata']
                     batch_id = batch_data['batch_id']
                     
-                    if batch_count % 20 == 0:  # Even less frequent debug
+                    if self.debug and batch_count % 20 == 0:  # Even less frequent debug
                         print(f"GPU {self.inference_gpu} received batch {batch_id} with {len(batch_frames)} frames")
                     
                     # Validate batch data
@@ -895,18 +898,18 @@ class DedicatedGPUPipeline:
                         continue
                         
                     # Check first frame format (only occasionally)
-                    if batch_count % 50 == 0:
+                    if self.debug and batch_count % 50 == 0:
                         first_frame = batch_frames[0]
                         print(f"GPU {self.inference_gpu} first frame shape: {first_frame.shape}, dtype: {first_frame.dtype}")
                     
                     # Pure inference on GPU 1 - Create proper batch tensor for GPU efficiency
                     with torch.cuda.device(self.inference_gpu):
                         # Monitor memory before batch processing (less frequently)
-                        if batch_count % 100 == 0:
+                        if self.debug and batch_count % 100 == 0:
                             memory_before = torch.cuda.memory_allocated(self.inference_gpu) / 1024**3
                             print(f"GPU {self.inference_gpu} memory before batch: {memory_before:.2f}GB")
                         
-                        if batch_count % 50 == 0:
+                        if self.debug and batch_count % 50 == 0:
                             print(f"GPU {self.inference_gpu} starting model.predict() for batch {batch_id}")
                         
                         # Use batch_frames directly - they are already preprocessed images
@@ -923,20 +926,20 @@ class DedicatedGPUPipeline:
                             save=False,    # Don't save predictions
                         )
                         
-                        if batch_count % 50 == 0:
+                        if self.debug and batch_count % 50 == 0:
                             print(f"GPU {self.inference_gpu} got results generator, converting to list...")
                         # Convert generator to list to process batch results
                         results = list(results_generator)
-                        if batch_count % 50 == 0:
+                        if self.debug and batch_count % 50 == 0:
                             print(f"GPU {self.inference_gpu} converted {len(results)} results from generator")
                         
                         # Monitor memory after batch processing (less frequently)
-                        if batch_count % 100 == 0:
+                        if self.debug and batch_count % 100 == 0:
                             memory_after = torch.cuda.memory_allocated(self.inference_gpu) / 1024**3
                             print(f"GPU {self.inference_gpu} memory after batch: {memory_after:.2f}GB, processed {len(results)} results")
                     
                     # Process results and send back
-                    if batch_count % 50 == 0:
+                    if self.debug and batch_count % 50 == 0:
                         print(f"GPU {self.inference_gpu} processing {len(batch_metadata)} metadata items")
                     results_sent = 0
                     for i, (frame_id, original_frame, pos_ms) in enumerate(batch_metadata):
@@ -951,16 +954,17 @@ class DedicatedGPUPipeline:
                                 self.result_queue.put(result_data, timeout=0.1)
                                 results_sent += 1
                             except queue.Full:
-                                if batch_count % 20 == 0:
+                                if self.debug and batch_count % 20 == 0:
                                     print(f"GPU {self.inference_gpu} result queue full after {results_sent} results")
                                 break  # Skip if result queue full
                     
                     batch_count += 1
-                    if batch_count % 20 == 0:
+                    if self.debug and batch_count % 20 == 0:
                         print(f"GPU {self.inference_gpu} completed batch {batch_id}, sent {results_sent} results")
                         
                 except queue.Empty:
-                    print(f"GPU {self.inference_gpu} timeout waiting for batch data")
+                    if self.debug:
+                        print(f"GPU {self.inference_gpu} timeout waiting for batch data")
                     continue
                 except Exception as e:
                     print(f"GPU {self.inference_gpu} inference error: {e}")
@@ -1963,6 +1967,10 @@ def main():
                         help="Output path for yield analysis CSV (default: auto-generated)")
     parser.add_argument("--yield-bin-seconds", type=float, default=10.0,
                         help="Time bin duration in seconds for yield analysis (default: 10.0)")
+    
+    # Debug options
+    parser.add_argument("--debug", action="store_true", default=False,
+                        help="Enable verbose debug logging for detailed pipeline information")
 
     args = parser.parse_args()
 
