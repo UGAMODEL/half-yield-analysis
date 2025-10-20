@@ -1524,15 +1524,18 @@ def main():
         # GPU-specific optimizations
         if torch and torch.cuda.is_available():
             print("GPU optimizations enabled: FP16 precision, memory management")
-            # Warm up the GPU
-            try:
-                dummy_input = np.zeros((1, MODEL_SIZE, MODEL_SIZE, 3), dtype=np.uint8)
-                _ = model.predict([dummy_input], verbose=False, imgsz=MODEL_SIZE)
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                print("GPU warmup complete")
-            except Exception as e:
-                print(f"GPU warmup failed: {e}")
+            # Warm up the GPU - skip for multi-GPU as each worker handles its own warmup
+            if not (args.multi_gpu and len(gpu_devices) > 1):
+                try:
+                    dummy_input = np.zeros((1, MODEL_SIZE, MODEL_SIZE, 3), dtype=np.uint8)
+                    _ = model.predict([dummy_input], verbose=False, imgsz=MODEL_SIZE)
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    print("GPU warmup complete")
+                except Exception as e:
+                    print(f"GPU warmup failed: {e}")
+            else:
+                print("Multi-GPU mode: individual GPU warmup handled by workers")
 
     try:
         if processor is not None:
