@@ -741,26 +741,42 @@ class MultiGPUFrameProcessor:
             return
         
         HALF_IDS, OBSCURED_IDS, PIECE_IDS, SHELL_IDS = self.class_config
+        print(f"GPU {gpu_id} worker started, waiting for frames...")
         
         while not self.stop_event.is_set():
             try:
                 # Collect a batch of frames for this GPU
                 batch_items = []
                 
-                for _ in range(self.batch_size):
+                # Collect frames with timeout to avoid hanging
+                for i in range(self.batch_size):
                     try:
-                        item = self.frame_queue.get(timeout=0.1)
+                        # Use shorter timeout for first frame, longer for subsequent
+                        timeout = 1.0 if i == 0 else 0.1
+                        item = self.frame_queue.get(timeout=timeout)
                         if item is None:  # Sentinel value
                             if batch_items:
                                 break  # Process what we have
                             else:
+                                print(f"GPU {gpu_id} worker exiting due to sentinel")
                                 return  # Exit worker
                         batch_items.append(item)
+                        
+                        # Debug output for first batch
+                        if len(batch_items) == 1 and batch_items[0][0] < 5:
+                            print(f"GPU {gpu_id} got first frame {batch_items[0][0]}")
+                            
                     except queue.Empty:
                         if batch_items:
-                            break  # Process partial batch
+                            # Process partial batch if we have some frames
+                            print(f"GPU {gpu_id} processing partial batch of {len(batch_items)} frames")
+                            break
+                        elif i == 0:
+                            # No frames available, continue waiting
+                            continue
                         else:
-                            continue  # Keep waiting
+                            # Got some frames but timed out getting more
+                            break
                 
                 if not batch_items:
                     continue
@@ -909,14 +925,22 @@ class MultiGPUFrameProcessor:
         """Add frame for processing (non-blocking)."""
         try:
             self.frame_queue.put((frame_id, frame, pos_ms), block=False)
+            # Debug output for first few frames
+            if frame_id < 3:
+                print(f"DEBUG: MultiGPU added frame {frame_id} to queue (queue size: {self.frame_queue.qsize()})")
             return True
         except queue.Full:
+            if frame_id < 3:
+                print(f"DEBUG: MultiGPU queue full when adding frame {frame_id}")
             return False
     
     def get_result(self, timeout=0.1):
         """Get processed result (non-blocking)."""
         try:
-            return self.result_queue.get(timeout=timeout)
+            result = self.result_queue.get(timeout=timeout)
+            if result and result[0] < 3:  # Debug first few results
+                print(f"DEBUG: MultiGPU got result for frame {result[0]} (result queue size: {self.result_queue.qsize()})")
+            return result
         except queue.Empty:
             return None
 
