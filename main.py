@@ -677,22 +677,26 @@ class MultiGPUFrameProcessor:
         self.model_path = model_path
         self.class_config = class_config
         self.args = args
-        self.frame_queue = queue.Queue(maxsize=max_queue_size)
+        # Create separate queues for each GPU to ensure load balancing
+        self.gpu_devices = get_gpu_devices()
+        self.frame_queues = [queue.Queue(maxsize=max_queue_size//len(self.gpu_devices)) for _ in self.gpu_devices]
         self.result_queue = queue.Queue(maxsize=max_queue_size)
         self.stop_event = threading.Event()
         self.batch_size = batch_size
         self.workers = []
-        self.gpu_devices = get_gpu_devices()
+        self.next_gpu = 0  # Round-robin assignment
         
         if not self.gpu_devices:
             raise RuntimeError("No CUDA devices available for multi-GPU processing")
+        
+        print(f"MultiGPU: Created {len(self.frame_queues)} separate queues for load balancing")
     
     def start_workers(self):
         """Start GPU workers, one per available GPU."""
-        for gpu_info in self.gpu_devices:
+        for i, gpu_info in enumerate(self.gpu_devices):
             worker = threading.Thread(
                 target=self._gpu_worker_loop, 
-                args=(gpu_info,),
+                args=(gpu_info, i),  # Pass queue index
                 name=f"GPU-{gpu_info['id']}-Worker"
             )
             worker.daemon = True
@@ -704,9 +708,9 @@ class MultiGPUFrameProcessor:
         """Stop all GPU workers."""
         self.stop_event.set()
         # Add sentinel values to unblock workers
-        for _ in range(len(self.gpu_devices)):
+        for frame_queue in self.frame_queues:
             try:
-                self.frame_queue.put(None, timeout=1.0)
+                frame_queue.put(None, timeout=1.0)
             except queue.Full:
                 pass
         
@@ -714,10 +718,11 @@ class MultiGPUFrameProcessor:
         for worker in self.workers:
             worker.join(timeout=3.0)
     
-    def _gpu_worker_loop(self, gpu_info):
+    def _gpu_worker_loop(self, gpu_info, queue_index):
         """Worker loop for a specific GPU."""
         gpu_id = gpu_info['id']
         device_str = gpu_info['device_str']
+        frame_queue = self.frame_queues[queue_index]  # Use dedicated queue
         
         # Load model on this specific GPU
         try:
@@ -753,7 +758,7 @@ class MultiGPUFrameProcessor:
                     try:
                         # Use shorter timeout for first frame, longer for subsequent
                         timeout = 1.0 if i == 0 else 0.1
-                        item = self.frame_queue.get(timeout=timeout)
+                        item = frame_queue.get(timeout=timeout)
                         if item is None:  # Sentinel value
                             if batch_items:
                                 break  # Process what we have
@@ -784,6 +789,7 @@ class MultiGPUFrameProcessor:
                 # Process batch on this GPU
                 try:
                     import torch
+                    print(f"GPU {gpu_id} starting batch processing of {len(batch_items)} frames")
                     if torch.cuda.is_available():
                         with torch.cuda.device(gpu_id):
                             batch_results = self._process_frame_batch_gpu(
@@ -794,12 +800,17 @@ class MultiGPUFrameProcessor:
                             batch_items, model, gpu_id, HALF_IDS, OBSCURED_IDS, PIECE_IDS, SHELL_IDS
                         )
                         
-                        # Put results back
-                        for result in batch_results:
-                            try:
-                                self.result_queue.put(result, timeout=1.0)
-                            except queue.Full:
-                                break  # Skip remaining if queue is full
+                    print(f"GPU {gpu_id} completed batch processing, got {len(batch_results)} results")
+                    
+                    # Put results back
+                    for result in batch_results:
+                        try:
+                            self.result_queue.put(result, timeout=1.0)
+                            if result[0] < 5:  # Debug first few results
+                                print(f"GPU {gpu_id} added result for frame {result[0]} to result queue")
+                        except queue.Full:
+                            print(f"GPU {gpu_id} result queue full, skipping remaining results")
+                            break  # Skip remaining if queue is full
                                 
                 except Exception as e:
                     print(f"GPU {gpu_id} batch processing error: {e}")
@@ -922,16 +933,22 @@ class MultiGPUFrameProcessor:
         return processor._process_single_result(frame, result, HALF_IDS, OBSCURED_IDS, PIECE_IDS, SHELL_IDS)
     
     def add_frame(self, frame_id, frame, pos_ms):
-        """Add frame for processing (non-blocking)."""
+        """Add frame for processing (round-robin across GPUs)."""
         try:
-            self.frame_queue.put((frame_id, frame, pos_ms), block=False)
+            # Round-robin assignment to GPU queues
+            gpu_queue = self.frame_queues[self.next_gpu]
+            gpu_queue.put((frame_id, frame, pos_ms), block=False)
+            
             # Debug output for first few frames
-            if frame_id < 3:
-                print(f"DEBUG: MultiGPU added frame {frame_id} to queue (queue size: {self.frame_queue.qsize()})")
+            if frame_id < 6:
+                print(f"DEBUG: MultiGPU added frame {frame_id} to GPU {self.next_gpu} queue (queue size: {gpu_queue.qsize()})")
+            
+            # Move to next GPU (round-robin)
+            self.next_gpu = (self.next_gpu + 1) % len(self.gpu_devices)
             return True
         except queue.Full:
-            if frame_id < 3:
-                print(f"DEBUG: MultiGPU queue full when adding frame {frame_id}")
+            if frame_id < 6:
+                print(f"DEBUG: MultiGPU queue {self.next_gpu} full when adding frame {frame_id}")
             return False
     
     def get_result(self, timeout=0.1):
