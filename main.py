@@ -103,9 +103,10 @@ def get_gpu_devices():
     return devices
 
 
-def get_optimal_batch_size(device, model_size=640, max_batch_size=256, memory_fraction=0.8):
+def get_optimal_batch_size(device, model_size=640, max_batch_size=256, memory_fraction=0.8, multi_gpu=False):
     """
     Determine optimal batch size based on available GPU memory.
+    For multi-GPU setups, can be more aggressive since each GPU has its own memory.
     """
     if not torch or not torch.cuda.is_available() or "cuda" not in device:
         return min(8, max_batch_size)  # Conservative default for non-CUDA
@@ -126,19 +127,33 @@ def get_optimal_batch_size(device, model_size=640, max_batch_size=256, memory_fr
         usable_memory = available_memory - model_overhead
         theoretical_max = int(usable_memory / bytes_per_frame)
         
-        # Apply safety factors and limits
-        safe_batch_size = min(theoretical_max // 2, max_batch_size)  # 50% safety margin
+        # Apply safety factors - be more aggressive for multi-GPU
+        if multi_gpu:
+            # Multi-GPU can be more aggressive since memory is separate per GPU
+            safety_factor = 0.75  # 75% of theoretical max
+            upper_limit = 512  # Allow larger batches for multi-GPU
+        else:
+            # Single GPU - more conservative
+            safety_factor = 0.5   # 50% of theoretical max  
+            upper_limit = max_batch_size
+            
+        safe_batch_size = min(int(theoretical_max * safety_factor), upper_limit)
         safe_batch_size = max(safe_batch_size, 1)  # At least 1
         
-        # Round to power of 2 for better GPU utilization
+        # Round to power of 2 for better GPU utilization, but allow larger powers for multi-GPU
         power_of_2 = 1
         while power_of_2 * 2 <= safe_batch_size:
             power_of_2 *= 2
         
         optimal_batch_size = power_of_2
         
+        gpu_count = torch.cuda.device_count() if multi_gpu else 1
+        total_capacity = optimal_batch_size * gpu_count
+        
         print(f"GPU Memory: {gpu_memory / (1024**3):.1f}GB, "
               f"Calculated optimal batch size: {optimal_batch_size}")
+        if multi_gpu:
+            print(f"Multi-GPU total capacity: {total_capacity} frames/batch across {gpu_count} GPUs")
         
         return optimal_batch_size
         
@@ -904,7 +919,7 @@ class MultiGPUFrameProcessor:
                 batch_frames.append(frame)
                 batch_metadata.append((frame_id, frame, pos_ms, resized))
             
-            # GPU batch inference
+            # GPU batch inference - use full batch without chunking
             try:
                 import torch
                 if torch.cuda.is_available():
@@ -912,53 +927,50 @@ class MultiGPUFrameProcessor:
             except Exception:
                 pass
                 
-            # Use smaller batch for more stable memory usage
-            effective_batch_size = min(len(batch_list), 128)  # Limit to 128 for memory stability
-            if len(batch_list) > effective_batch_size:
-                print(f"GPU {gpu_id} splitting large batch {len(batch_list)} into chunks of {effective_batch_size}")
+            # Process the full batch at once for maximum efficiency
+            try:
+                results = model.predict(
+                    batch_list, 
+                    imgsz=MODEL_SIZE, 
+                    verbose=False, 
+                    conf=self.args.conf,
+                    device=f"cuda:{gpu_id}",
+                    half=True,  # Use FP16 for speed
+                    augment=False,
+                )
+                all_results = results
                 
-            all_results = []
-            for i in range(0, len(batch_list), effective_batch_size):
-                chunk = batch_list[i:i+effective_batch_size]
-                
-                try:
-                    results = model.predict(
-                        chunk, 
-                        imgsz=MODEL_SIZE, 
-                        verbose=False, 
-                        conf=self.args.conf,
-                        device=f"cuda:{gpu_id}",
-                        half=True,  # Use FP16 for speed
-                        augment=False,
-                    )
-                    all_results.extend(results)
-                    
-                except Exception as e:
-                    if "out of memory" in str(e).lower():
-                        print(f"GPU {gpu_id} OOM with chunk size {len(chunk)}, clearing cache and retrying with smaller batch")
-                        try:
-                            import torch
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-                        except Exception:
-                            pass
-                        # Retry with smaller batch
-                        for single_item in chunk:
-                            try:
-                                single_result = model.predict(
-                                    [single_item], 
-                                    imgsz=MODEL_SIZE, 
-                                    verbose=False, 
-                                    conf=self.args.conf,
-                                    device=f"cuda:{gpu_id}",
-                                    half=False,  # Use FP32 as fallback
-                                    augment=False,
-                                )
-                                all_results.extend(single_result)
-                            except Exception:
-                                continue
-                    else:
-                        raise e
+            except Exception as e:
+                if "out of memory" in str(e).lower():
+                    print(f"GPU {gpu_id} OOM with batch size {len(batch_list)}, falling back to smaller batch")
+                    try:
+                        import torch
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        
+                        # Only fallback to chunking if OOM occurs
+                        chunk_size = max(32, len(batch_list) // 4)  # Use larger chunks
+                        print(f"GPU {gpu_id} using fallback chunk size: {chunk_size}")
+                        
+                        all_results = []
+                        for i in range(0, len(batch_list), chunk_size):
+                            chunk = batch_list[i:i+chunk_size]
+                            chunk_results = model.predict(
+                                chunk, 
+                                imgsz=MODEL_SIZE, 
+                                verbose=False, 
+                                conf=self.args.conf,
+                                device=f"cuda:{gpu_id}",
+                                half=True,
+                                augment=False,
+                            )
+                            all_results.extend(chunk_results)
+                    except Exception:
+                        print(f"GPU {gpu_id} fallback also failed, returning empty results")
+                        return []
+                else:
+                    print(f"GPU {gpu_id} processing error: {e}")
+                    return []
             
             # Process results
             batch_results = []
@@ -1638,25 +1650,39 @@ def main():
     # Initialize parallel processing if requested and not in GUI mode
     processor = None
     if args.parallel and not args.show:
-        # Auto-detect optimal batch size if not specified
+        # Check if multi-GPU mode will be used
+        gpu_devices = get_gpu_devices()
+        will_use_multi_gpu = args.multi_gpu and len(gpu_devices) > 1
+        
+        # Auto-detect optimal batch size with multi-GPU awareness
         if args.batch_size == 0:
-            optimal_batch_size = get_optimal_batch_size(device, MODEL_SIZE, args.max_batch_size, args.gpu_memory_fraction)
+            optimal_batch_size = get_optimal_batch_size(
+                device, MODEL_SIZE, args.max_batch_size, args.gpu_memory_fraction, 
+                multi_gpu=will_use_multi_gpu
+            )
         else:
             optimal_batch_size = args.batch_size
             
         class_config = (HALF_IDS, OBSCURED_IDS, PIECE_IDS, SHELL_IDS)
         
         # Check for multi-GPU support
-        gpu_devices = get_gpu_devices()
         multi_gpu_queue_size = args.queue_size  # Default to normal queue size
         
-        if args.multi_gpu and len(gpu_devices) > 1:
+        if will_use_multi_gpu:
             print(f"Multi-GPU mode enabled: {len(gpu_devices)} GPUs detected")
+            # For multi-GPU, each GPU can use larger batches since memory is separate
+            # Increase batch size for multi-GPU: each GPU gets its own optimal batch size
+            if args.batch_size == 0:
+                multi_gpu_batch_size = optimal_batch_size  # Each GPU uses full optimal batch
+                print(f"Multi-GPU: Each GPU will use batch size {multi_gpu_batch_size} (total capacity: {multi_gpu_batch_size * len(gpu_devices)})")
+            else:
+                multi_gpu_batch_size = args.batch_size
+            
             # Increase queue size for multi-GPU to allow larger batches
-            multi_gpu_queue_size = max(args.queue_size, len(gpu_devices) * optimal_batch_size + 100)
-            processor = MultiGPUFrameProcessor(args.model, class_config, args, multi_gpu_queue_size, optimal_batch_size)
+            multi_gpu_queue_size = max(args.queue_size, len(gpu_devices) * multi_gpu_batch_size + 100)
+            processor = MultiGPUFrameProcessor(args.model, class_config, args, multi_gpu_queue_size, multi_gpu_batch_size)
             processor.start_workers()
-            print(f"Multi-GPU processing started: {len(gpu_devices)} GPU workers, batch size: {optimal_batch_size}, queue size: {multi_gpu_queue_size}")
+            print(f"Multi-GPU processing started: {len(gpu_devices)} GPU workers, batch size: {multi_gpu_batch_size}, queue size: {multi_gpu_queue_size}")
         else:
             if args.multi_gpu and len(gpu_devices) <= 1:
                 print("Multi-GPU requested but only 1 GPU available, falling back to single-GPU mode")
@@ -1689,8 +1715,9 @@ def main():
             
             # Use larger queue size for multi-GPU processors
             if hasattr(processor, 'frame_queues'):
-                # Multi-GPU processor - use much larger queue (2 GPUs × 256 batch × 2 + buffer)
-                effective_queue_size = 2 * 256 * 2 + 50  # ~1074 frames
+                # Multi-GPU processor - use much larger queue for higher throughput
+                # 2 GPUs × 512 batch × 2 + buffer = ~2100 frames
+                effective_queue_size = 2 * 512 * 2 + 100  
                 print(f"Multi-GPU mode: using large queue size: {effective_queue_size}")
             else:
                 # Single GPU processor - use normal queue size
