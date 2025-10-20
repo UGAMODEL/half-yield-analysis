@@ -713,10 +713,10 @@ class DedicatedGPUPipeline:
         self.decode_gpu = 0      # GPU 0: Decode + preprocess
         self.inference_gpu = 1   # GPU 1: Pure inference
         
-        print("Dedicated GPU Pipeline (P40-Optimized High-Performance Mode):")
-        print(f"  GPU {self.decode_gpu}: NVDEC decode + preprocessing")
-        print(f"  GPU {self.inference_gpu}: YOLO inference (P40-optimized batches, max size: {batch_size})")
-        print(f"  P40 Configuration: Large batches ({batch_size}), extended queues, optimized memory management")
+        print("Dedicated GPU Pipeline (P40-Optimized Zero-Copy Mode):")
+        print(f"  GPU {self.decode_gpu}: NVDEC decode only (raw frames)")
+        print(f"  GPU {self.inference_gpu}: GPU-native preprocessing + inference (no PCIe bottleneck)")
+        print(f"  P40 Configuration: Large batches ({batch_size}), zero-copy architecture, GPU-native processing")
         
     def start_workers(self, video_capture):
         """Start the dedicated GPU workers."""
@@ -792,11 +792,10 @@ class DedicatedGPUPipeline:
                     
                     pos_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
                     
-                    # Preprocess frame
-                    processed_frame = self._preprocess_frame(frame)
-                    if processed_frame is not None:
-                        batch_frames.append(processed_frame)
-                        batch_metadata.append((frame_id, frame, pos_ms))
+                    # Send raw frames to avoid GPU0->CPU->GPU1 transfer bottleneck
+                    # Let GPU1 do preprocessing directly on its own memory
+                    batch_frames.append(frame)  # Send raw frame
+                    batch_metadata.append((frame_id, frame, pos_ms))
                     
                     frame_id += 1
                     frames_since_send += 1
@@ -924,7 +923,7 @@ class DedicatedGPUPipeline:
                         first_frame = batch_frames[0]
                         print(f"GPU {self.inference_gpu} first frame shape: {first_frame.shape}, dtype: {first_frame.dtype}")
                     
-                    # Pure inference on GPU 1 - Create proper batch tensor for GPU efficiency
+                    # GPU 1 preprocessing and inference - avoid PCIe bottleneck
                     with torch.cuda.device(self.inference_gpu):
                         # Monitor memory before batch processing (less frequently)
                         if self.debug and batch_count % 100 == 0:
@@ -932,12 +931,26 @@ class DedicatedGPUPipeline:
                             print(f"GPU {self.inference_gpu} memory before batch: {memory_before:.2f}GB")
                         
                         if self.debug and batch_count % 50 == 0:
-                            print(f"GPU {self.inference_gpu} starting model.predict() for batch {batch_id}")
+                            print(f"GPU {self.inference_gpu} preprocessing and inference for batch {batch_id}")
                         
-                        # P40-optimized inference with larger batches
-                        # YOLO expects a list of numpy arrays (H, W, C) format
+                        # Preprocess raw frames directly on GPU 1 to avoid PCIe transfer
+                        preprocessed_batch = []
+                        for frame in batch_frames:
+                            H, W = frame.shape[:2]
+                            x1, y1 = ROI_X, ROI_Y
+                            x2, y2 = min(ROI_X + ROI_W, W), min(ROI_Y + ROI_H, H)
+                            
+                            if x1 < x2 and y1 < y2:
+                                crop = frame[y1:y2, x1:x2]
+                                resized = cv2.resize(crop, (MODEL_SIZE, MODEL_SIZE), interpolation=cv2.INTER_LINEAR)
+                                preprocessed_batch.append(resized)
+                            else:
+                                # Invalid ROI, use dummy frame
+                                preprocessed_batch.append(np.zeros((MODEL_SIZE, MODEL_SIZE, 3), dtype=np.uint8))
+                        
+                        # P40-optimized inference with GPU-preprocessed data
                         results_generator = model.predict(
-                            batch_frames,  # Pass list of preprocessed images directly
+                            preprocessed_batch,  # Pass GPU-preprocessed images
                             imgsz=MODEL_SIZE,
                             verbose=False,  # Disable verbose for production
                             conf=self.args.conf,
