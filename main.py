@@ -699,8 +699,8 @@ class DedicatedGPUPipeline:
         self.batch_size = batch_size
         
         # Queues for pipeline communication
-        self.preprocessed_queue = queue.Queue(maxsize=5)   # Smaller queue to prevent memory buildup
-        self.result_queue = queue.Queue(maxsize=100)       # Results back to main thread
+        self.preprocessed_queue = queue.Queue(maxsize=20)  # Larger queue to handle decode/inference speed mismatch
+        self.result_queue = queue.Queue(maxsize=200)       # Results back to main thread
         self.stop_event = threading.Event()
         
         # Workers
@@ -796,15 +796,15 @@ class DedicatedGPUPipeline:
                         }
                         
                         try:
-                            self.preprocessed_queue.put(batch_data, timeout=0.5)
+                            self.preprocessed_queue.put(batch_data, timeout=2.0)  # Longer timeout before dropping
                             if batch_count < 5:  # Debug early batches
                                 print(f"GPU {self.decode_gpu} → batch {batch_count} ({len(batch_frames)} frames) → GPU {self.inference_gpu}")
                             batch_frames = []
                             batch_metadata = []
                             batch_count += 1
                         except queue.Full:
-                            # Drop oldest batch and try again
-                            print(f"GPU {self.decode_gpu} queue full, dropping batch {batch_count}")
+                            # Only drop if absolutely necessary - increase timeout helped
+                            print(f"GPU {self.decode_gpu} queue still full after 2s, dropping batch {batch_count}")
                             batch_frames = []
                             batch_metadata = []
                 
@@ -863,7 +863,7 @@ class DedicatedGPUPipeline:
                     
                     # Pure inference on GPU 1
                     with torch.cuda.device(self.inference_gpu):
-                        results = model.predict(
+                        results_generator = model.predict(
                             batch_frames,
                             imgsz=MODEL_SIZE,
                             verbose=False,
@@ -871,9 +871,11 @@ class DedicatedGPUPipeline:
                             device=f"cuda:{self.inference_gpu}",
                             half=True,
                             augment=False,
-                            stream=False,  # We want results immediately, not a generator
+                            stream=True,   # Use stream=True to prevent memory accumulation warnings
                             save=False,    # Don't save predictions
                         )
+                        # Convert generator to list to process batch results
+                        results = list(results_generator)
                     
                     # Process results and send back
                     for i, (frame_id, original_frame, pos_ms) in enumerate(batch_metadata):
