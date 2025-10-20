@@ -679,7 +679,9 @@ class MultiGPUFrameProcessor:
         self.args = args
         # Create separate queues for each GPU to ensure load balancing
         self.gpu_devices = get_gpu_devices()
-        self.frame_queues = [queue.Queue(maxsize=max_queue_size//len(self.gpu_devices)) for _ in self.gpu_devices]
+        # Use smaller per-GPU queues to prevent memory imbalance
+        per_gpu_queue_size = max(20, max_queue_size // (2 * len(self.gpu_devices)))
+        self.frame_queues = [queue.Queue(maxsize=per_gpu_queue_size) for _ in self.gpu_devices]
         self.result_queue = queue.Queue(maxsize=max_queue_size)
         self.stop_event = threading.Event()
         self.batch_size = batch_size
@@ -689,7 +691,7 @@ class MultiGPUFrameProcessor:
         if not self.gpu_devices:
             raise RuntimeError("No CUDA devices available for multi-GPU processing")
         
-        print(f"MultiGPU: Created {len(self.frame_queues)} separate queues for load balancing")
+        print(f"MultiGPU: Created {len(self.frame_queues)} separate queues (size {per_gpu_queue_size} each) for load balancing")
     
     def start_workers(self):
         """Start GPU workers, one per available GPU."""
@@ -798,6 +800,17 @@ class MultiGPUFrameProcessor:
                 # Process batch on this GPU
                 try:
                     import torch
+                    
+                    # Monitor GPU memory before processing
+                    if torch.cuda.is_available():
+                        torch.cuda.set_device(gpu_id)
+                        memory_before = torch.cuda.memory_allocated(gpu_id) / 1024**3  # GB
+                        memory_total = torch.cuda.get_device_properties(gpu_id).total_memory / 1024**3  # GB
+                        memory_percent = (memory_before / memory_total) * 100
+                        
+                        if len(batch_items) > 100:  # Only log for significant batches
+                            print(f"GPU {gpu_id} memory: {memory_before:.1f}GB/{memory_total:.1f}GB ({memory_percent:.1f}%) before batch of {len(batch_items)}")
+                    
                     print(f"GPU {gpu_id} starting batch processing of {len(batch_items)} frames")
                     if torch.cuda.is_available():
                         with torch.cuda.device(gpu_id):
@@ -890,15 +903,53 @@ class MultiGPUFrameProcessor:
             except Exception:
                 pass
                 
-            results = model.predict(
-                batch_list, 
-                imgsz=MODEL_SIZE, 
-                verbose=False, 
-                conf=self.args.conf,
-                device=f"cuda:{gpu_id}",
-                half=True,  # Use FP16 for speed
-                augment=False,
-            )
+            # Use smaller batch for more stable memory usage
+            effective_batch_size = min(len(batch_list), 128)  # Limit to 128 for memory stability
+            if len(batch_list) > effective_batch_size:
+                print(f"GPU {gpu_id} splitting large batch {len(batch_list)} into chunks of {effective_batch_size}")
+                
+            all_results = []
+            for i in range(0, len(batch_list), effective_batch_size):
+                chunk = batch_list[i:i+effective_batch_size]
+                
+                try:
+                    results = model.predict(
+                        chunk, 
+                        imgsz=MODEL_SIZE, 
+                        verbose=False, 
+                        conf=self.args.conf,
+                        device=f"cuda:{gpu_id}",
+                        half=True,  # Use FP16 for speed
+                        augment=False,
+                    )
+                    all_results.extend(results)
+                    
+                except Exception as e:
+                    if "out of memory" in str(e).lower():
+                        print(f"GPU {gpu_id} OOM with chunk size {len(chunk)}, clearing cache and retrying with smaller batch")
+                        try:
+                            import torch
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                        except Exception:
+                            pass
+                        # Retry with smaller batch
+                        for single_item in chunk:
+                            try:
+                                single_result = model.predict(
+                                    [single_item], 
+                                    imgsz=MODEL_SIZE, 
+                                    verbose=False, 
+                                    conf=self.args.conf,
+                                    device=f"cuda:{gpu_id}",
+                                    half=False,  # Use FP32 as fallback
+                                    augment=False,
+                                )
+                                all_results.extend(single_result)
+                            except Exception:
+                                continue
+                    else:
+                        raise e
             
             # Process results
             batch_results = []
@@ -909,8 +960,8 @@ class MultiGPUFrameProcessor:
                     batch_results.append((frame_id, frame, 0.0, 0.0, pos_ms))
                     continue
                 
-                if result_idx < len(results):
-                    r = results[result_idx]
+                if result_idx < len(all_results):
+                    r = all_results[result_idx]
                     result_idx += 1
                     
                     out, half_area, piece_area = self._process_single_result_gpu(
@@ -943,22 +994,30 @@ class MultiGPUFrameProcessor:
     
     def add_frame(self, frame_id, frame, pos_ms):
         """Add frame for processing (round-robin across GPUs)."""
-        try:
-            # Round-robin assignment to GPU queues
-            gpu_queue = self.frame_queues[self.next_gpu]
-            gpu_queue.put((frame_id, frame, pos_ms), block=False)
-            
-            # Debug output for first few frames
-            if frame_id < 6:
-                print(f"DEBUG: MultiGPU added frame {frame_id} to GPU {self.next_gpu} queue (queue size: {gpu_queue.qsize()})")
-            
-            # Move to next GPU (round-robin)
-            self.next_gpu = (self.next_gpu + 1) % len(self.gpu_devices)
-            return True
-        except queue.Full:
-            if frame_id < 6:
-                print(f"DEBUG: MultiGPU queue {self.next_gpu} full when adding frame {frame_id}")
-            return False
+        # Try all GPUs starting from next_gpu to ensure load balancing
+        for attempt in range(len(self.gpu_devices)):
+            gpu_index = (self.next_gpu + attempt) % len(self.gpu_devices)
+            try:
+                gpu_queue = self.frame_queues[gpu_index]
+                gpu_queue.put((frame_id, frame, pos_ms), block=False)
+                
+                # Debug output for first few frames
+                if frame_id < 6:
+                    print(f"DEBUG: MultiGPU added frame {frame_id} to GPU {gpu_index} queue (queue size: {gpu_queue.qsize()})")
+                
+                # Move to next GPU only on successful placement
+                self.next_gpu = (gpu_index + 1) % len(self.gpu_devices)
+                return True
+                
+            except queue.Full:
+                if frame_id < 6:
+                    print(f"DEBUG: MultiGPU queue {gpu_index} full when adding frame {frame_id}, trying next GPU")
+                continue
+        
+        # All queues are full
+        if frame_id < 6:
+            print(f"DEBUG: All MultiGPU queues full when adding frame {frame_id}")
+        return False
     
     def get_result(self, timeout=0.1):
         """Get processed result (non-blocking)."""
