@@ -120,6 +120,33 @@ pixi run demo        # Runs with video.mp4
 uv run main.py --source video.mp4 --model halfyield-model.pt --show --show-chart
 ```
 
+### Real-time RTSP Runner (Single NVIDIA GPU)
+
+For low-latency, single-GPU deployments subscribe directly to an RTSP stream with
+`rtsp_runner.py`. The runner keeps the stream real-time by using micro-batching,
+optional NVDEC decode, and frame dropping when inference lags.
+
+```bash
+# Inside pixi shell or any environment with dependencies installed
+python rtsp_runner.py \
+   --rtsp-url rtsp://camera-ip/live \
+   --model halfyield-model.pt \
+   --show \
+   --overlay-stats
+```
+
+Key options:
+
+- `--batch-size` / `--batch-timeout`: control micro-batch size or max wait before forcing inference (defaults: 8 frames / 80 ms).
+- `--nvdec` / `--nvenc`: enable hardware decode/recording when CUDA is available.
+- `--flush-frames`: grab + drop extra frames each loop to aggressively cut latency.
+- `--record PATH`: persist the annotated stream (uses NVENC when possible).
+- `--overlay-stats`: draws live FPS, latency, and drop counts on the output frame.
+- `--hw-device`: pick the CUDA device index used for NVDEC/NVENC (default: 0).
+
+The runner automatically reconnects to the RTSP source, prefers `cuda:0`, and shows
+GPU memory information at startup when CUDA is available.
+
 ### Key Options
 
 - `--source PATH` (required): input video file  
