@@ -130,12 +130,6 @@ def _run_stream(args: argparse.Namespace) -> None:
         except Exception:
             pass
         torch.backends.cudnn.benchmark = True
-        model_core = getattr(model, "model", None)
-        if model_core is not None and hasattr(model_core, "half"):
-            try:
-                model_core.half()
-            except Exception:
-                pass
 
     id_to_name, _ = names_maps(model.names)
     HALF_IDS = class_ids_for(["half"], id_to_name)
