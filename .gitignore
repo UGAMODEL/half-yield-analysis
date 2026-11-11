@@ -2,3 +2,5 @@
 uv.lock
 pixi.lock
 *.csv
+
+__pycache__/

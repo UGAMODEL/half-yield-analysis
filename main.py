@@ -26,6 +26,12 @@ import time
 import cv2
 import numpy as np
 
+from operator_dashboard import OperatorDashboard
+from calibration import Calibration
+from yield_history import YieldHistory, integrated_ratio_last
+from hmi_style import InspectionOverlay
+from copy import deepcopy
+
 # Ultralytics YOLO
 try:
     from ultralytics import YOLO
@@ -358,39 +364,6 @@ def class_ids_for(substrings, id_to_name):
 
 # --------- Time-integrated ratio helpers ---------
 
-def integrated_ratio_last(samples, window_ms):
-    """
-    Compute time-integrated ratio over the last `window_ms` ending at the most recent sample.
-    samples: deque/list of (t_ms, half_area, piece_area), t_ms strictly increasing.
-    Uses left-Riemann (area at segment's left endpoint) per interval.
-    """
-    if len(samples) < 2:
-        return None
-
-    t_end = samples[-1][0]
-    cutoff = t_end - window_ms
-    N = 0.0
-    D = 0.0
-
-    # Iterate segments [i] -> [i+1], include overlap with [cutoff, t_end]
-    for i in range(len(samples) - 1):
-        t0, half0, piece0 = samples[i]
-        t1, _, _ = samples[i + 1]
-
-        seg_start = max(t0, cutoff)
-        seg_end = t1
-        if seg_end <= seg_start:
-            continue
-
-        dt = (seg_end - seg_start) / 1000.0  # seconds (unit cancels; consistent)
-        N += half0 * dt
-        D += (half0 + piece0) * dt
-
-    if D <= 0.0:
-        return None
-    return N / D
-
-
 def integrated_ratio_series(samples, window_ms):
     """
     Build a time series of integrated ratio values for plotting.
@@ -645,6 +618,8 @@ def save_yield_report(stats, output_path=None, video_path=None):
     print(f"Total Piece Area (integrated): {stats['total_piece_area']:.2f}")
     print(f"Total Area (half + piece): {stats['total_area']:.2f}")
     print(f"NET AVERAGE YIELD: {stats['net_average']:.4f} ({stats['net_average']*100:.2f}%)")
+    if stats.get('estimated_half_mass_share') is not None:
+        print(f"ESTIMATED HALF MASS SHARE: {stats['estimated_half_mass_share']:.2%}")
     print("="*60)
     
     if stats['binned_data']:
@@ -668,12 +643,21 @@ def save_yield_report(stats, output_path=None, video_path=None):
             writer.writerow(['# Net Average Yield:', f"{stats['net_average']:.6f}"])
             writer.writerow(['# Total Half Area:', f"{stats['total_half_area']:.2f}"])
             writer.writerow(['# Total Piece Area:', f"{stats['total_piece_area']:.2f}"])
+            for name, value in stats.get('calibration', {}).items():
+                writer.writerow([f'# Calibration {name}:', value])
+            writer.writerow(['# Estimated Half Mass Share:', stats.get('estimated_half_mass_share')])
+            writer.writerow(['# Mass estimate basis:', 'Area coefficients; not measured weight or unique material throughput'])
             writer.writerow([''])
             
             # Write binned data
-            writer.writerow(['Time_Start_Seconds', 'Yield_Ratio', 'Half_Area_Integrated', 'Piece_Area_Integrated', 'Total_Area'])
+            writer.writerow(['Time_Start_Seconds', 'Yield_Ratio', 'Half_Area_Integrated', 'Piece_Area_Integrated', 'Total_Area', 'Estimated_Half_Mass_Share'])
             for bin_start, bin_yield, bin_half, bin_piece in stats['binned_data']:
-                writer.writerow([f"{bin_start:.1f}", f"{bin_yield:.6f}", f"{bin_half:.2f}", f"{bin_piece:.2f}", f"{bin_half + bin_piece:.2f}"])
+                coefficients = stats.get('calibration', {})
+                half_mass = bin_half * coefficients.get('half_mass_per_area_g_per_model_pixel2', .001)
+                piece_mass = bin_piece * coefficients.get('piece_mass_per_area_g_per_model_pixel2', .001)
+                mass_share = half_mass / (half_mass + piece_mass) if half_mass + piece_mass > 0 else ''
+                writer.writerow([f"{bin_start:.1f}", f"{bin_yield:.6f}", f"{bin_half:.2f}",
+                                 f"{bin_piece:.2f}", f"{bin_half + bin_piece:.2f}", mass_share])
         
         print(f"\nDetailed analysis saved to: {output_path}")
         
@@ -1721,18 +1705,7 @@ class FrameProcessor:
 
         id_to_name, _ = names_maps(self.model.names)
 
-        for poly, cid in polygons:
-            pts = np.round(poly).astype(np.int32).reshape(-1, 1, 2)
-            cv2.polylines(out, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
-
-            # class label above centroid
-            M = cv2.moments(pts)
-            if M["m00"] != 0:
-                cx = int(M["m10"] / M["m00"])
-                cy = int(M["m01"] / M["m00"])
-                label = str(id_to_name.get(int(cid), int(cid)))
-                cv2.putText(out, label, (cx, cy - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+        InspectionOverlay.draw(out, polygons, id_to_name)
 
         return out, half_area_sum, piece_area_sum
 
@@ -1855,18 +1828,7 @@ def process_frame(
 
     id_to_name, _ = names_maps(model.names)
 
-    for poly, cid in polygons:
-        pts = np.round(poly).astype(np.int32).reshape(-1, 1, 2)
-        cv2.polylines(out, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
-
-        # class label above centroid
-        M = cv2.moments(pts)
-        if M["m00"] != 0:
-            cx = int(M["m10"] / M["m00"])
-            cy = int(M["m01"] / M["m00"])
-            label = str(id_to_name.get(int(cid), int(cid)))
-            cv2.putText(out, label, (cx, cy - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+    InspectionOverlay.draw(out, polygons, id_to_name)
 
     return out, half_area_sum, piece_area_sum
 
@@ -2008,7 +1970,24 @@ def main():
     parser.add_argument("--debug", action="store_true", default=False,
                         help="Enable verbose debug logging for detailed pipeline information")
 
+    parser.add_argument('--half-mass-per-area', type=float, default=.001,
+                        help='Approximate half mass coefficient in g/model pixel squared (placeholder default).')
+    parser.add_argument('--piece-mass-per-area', type=float, default=.001,
+                        help='Approximate piece mass coefficient in g/model pixel squared (placeholder default).')
     args = parser.parse_args()
+    for name in ('ratio_window_sec', 'skip_seconds', 'yield_bin_seconds'):
+        value = getattr(args, name)
+        if not np.isfinite(value) or value <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be a positive finite number")
+
+    for name in ('conf', 'half_conf', 'piece_conf', 'obscured_conf', 'shell_conf'):
+        value = getattr(args, name)
+        if value is not None and (not np.isfinite(value) or not 0 <= value <= 1):
+            parser.error(f"--{name.replace('_', '-')} must be between 0 and 1")
+    for name in ('half_mass_per_area', 'piece_mass_per_area'):
+        value = getattr(args, name)
+        if not np.isfinite(value) or not 1e-6 <= value <= 1:
+            parser.error(f"--{name.replace('_', '-')} must be between 0.000001 and 1 g/model pixel squared")
 
     src = Path(args.source)
     if not src.exists():
@@ -2041,6 +2020,13 @@ def main():
         "shell":    args.shell_conf,
     }
 
+    class_thresh = {name: args.conf if value is None else value for name, value in class_thresh.items()}
+    calibration = Calibration(class_thresh.copy(), args.half_mass_per_area, args.piece_mass_per_area)
+    # The inference prefilter must not discard detections allowed by a class slider.
+    args.conf = min(class_thresh.values())
+    for name, value in class_thresh.items():
+        setattr(args, f'{name}_conf', value)
+
     cap = create_video_capture(src, use_nvdec=args.nvdec)
     
     # Get video properties for debug information
@@ -2070,14 +2056,20 @@ def main():
     if args.save is not None:
         writer = create_video_writer(args.save, fps, width, height, use_nvenc=args.nvenc)
 
-    window_name = "YOLOv12n-seg Contour Tracking"
+    window_name = "HalfYield | Processing review"
+    dashboard = None
     if args.show:
-        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        dashboard = OperatorDashboard(window_name, src, args.ratio_window_sec, args.skip_seconds)
+        dashboard.calibration = deepcopy(calibration)
+        dashboard.calibration_controls.calibration = dashboard.calibration
+        if not args.yield_report:
+            dashboard.notice = "CSV reporting is disabled for this session."
 
     paused = False
+    complete = False
     slow = False
     # Store raw areas per timestamp (t_ms, half_area, piece_area)
-    area_hist = deque()  # For real-time ratio calculation (trimmed to window)
+    yield_history = YieldHistory(float(args.ratio_window_sec) * 1000.0)
     complete_area_hist = deque()  # For final yield analysis (never trimmed)
     last_frame = None  # reuse current frame while paused
     
@@ -2239,7 +2231,11 @@ def main():
                 if not paused:
                     ret, frame = cap.read()
                     if not ret:
-                        break
+                        if not args.show or last_frame is None:
+                            break
+                        complete = True
+                        paused = True
+                        frame = last_frame
                     last_frame = frame
                     frame_count += 1
                     
@@ -2277,102 +2273,66 @@ def main():
                     min_area_px=args.min_area,
                 )
 
-                # Only append when we're not paused and time advanced
-                if not paused and np.isfinite(pos_ms):
-                    data_point = (float(pos_ms), float(half_area), float(piece_area))
-                    area_hist.append(data_point)
-                    complete_area_hist.append(data_point)  # Keep complete history for final analysis
-
-                # Trim by time window (keep only segments overlapping last ratio-window-sec)
-                window_ms = float(args.ratio_window_sec) * 1000.0
-                if area_hist:
-                    t_now = area_hist[-1][0]
-                    cutoff = t_now - window_ms
-                    while len(area_hist) > 1 and area_hist[0][0] < cutoff:
-                        # Keep at least one sample before cutoff to define the leading segment
-                        area_hist.popleft()
+                # Calculate each chart point once, using the history available at its timestamp.
+                if not paused and yield_history.append(float(pos_ms), float(half_area), float(piece_area)):
+                    complete_area_hist.append((float(pos_ms), float(half_area), float(piece_area)))
 
                 # Save only while playing to keep linear output
                 if writer is not None and not paused:
                     writer.write(out)
 
                 if args.show:
-                    # Overlay UI hints
-                    overlay = out.copy()
-                    hint = ("SPACE: pause/play | "
-                            f"←/→: -{float(args.skip_seconds):.1f}s/+{float(args.skip_seconds):.1f}s (play) "
-                            "| prev/next frame (pause) | ,/.: prev/next | S: slow | Q: quit")
-                    cv2.putText(overlay, hint, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
-                                (255, 255, 255), 2, cv2.LINE_AA)
-                    state = "PAUSED" if paused else "PLAYING"
-                    cv2.putText(overlay, state, (12, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                                (0, 255, 255), 2, cv2.LINE_AA)
-
-                    # Compute current integrated ratio and (optionally) series for chart
-                    ratio_now = integrated_ratio_last(list(area_hist), window_ms)
-                    if ratio_now is not None:
-                        cv2.putText(overlay, f"Integrated {int(args.ratio_window_sec)}s ratio: {ratio_now:.3f}",
-                                    (12, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                                    (255, 255, 255), 2, cv2.LINE_AA)
-
-                    cv2.addWeighted(overlay, 0.35, out, 0.65, 0, out)
-
-                    if args.show_chart:
-                        series = integrated_ratio_series(list(area_hist), window_ms)
-                        draw_ratio_chart_time(out, series, args.chart_width, args.chart_height,
-                                              corner=args.chart_pos, label_prefix=f"{int(args.ratio_window_sec)}s ratio")
-
-                    cv2.imshow(window_name, out)
+                    ratio_now = yield_history.current
+                    series = list(yield_history.points)
+                    display = dashboard.render(
+                        out, ratio_now, series, duration_sec if complete else pos_ms / 1000.0, duration_sec,
+                        paused, slow, complete,
+                    )
+                    cv2.imshow(window_name, display)
                     k = cv2.waitKey(200 if slow else (150 if paused else 1)) & 0xFFFF
-                    action = parse_key(k)
+                    action = dashboard.read_action(parse_key(k))
+                    if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+                        break
+
+                    if action == 'calibration_changed':
+                        calibration = deepcopy(dashboard.calibration)
+                        class_thresh.update(calibration.thresholds)
+                        args.conf = min(class_thresh.values())
+                        yield_history.clear()
+                        complete_area_hist.clear()
+                        dashboard.notice = 'Calibration applied. New report segment; resume playback to collect samples.'
+                        continue
+
+                    if action in ('left', 'right', 'seek_back', 'seek_forward', 'prev_frame', 'next_frame'):
+                        yield_history.clear()
+                        complete_area_hist.clear()
+                        complete = False
+                        dashboard.notice = 'New analysis segment. CSV includes playback after the most recent seek or step.'
 
                     if action == 'quit':
                         break
 
                     elif action == 'toggle_pause':
-                        paused = not paused
+                        paused = True if complete else not paused
                         continue
 
                     elif action == 'toggle_slow':
                         slow = not slow
                         continue
 
-                    elif action == 'left':
+                    elif action in ('left', 'right', 'seek_back', 'seek_forward', 'prev_frame', 'next_frame'):
+                        backward = action in ('left', 'seek_back', 'prev_frame')
+                        step = action in ('prev_frame', 'next_frame') or (paused and action in ('left', 'right'))
+                        if step:
+                            # Capture position points to the next unread frame.
+                            apply_step_frame(cap, -2 if backward else 0)
+                            paused = True
+                        else:
+                            apply_seek(cap, (-1 if backward else 1) * float(args.skip_seconds))
                         if paused:
-                            # prev frame
-                            apply_step_frame(cap, -1)
                             ret, frame = cap.read()
                             if ret:
                                 last_frame = frame
-                        else:
-                            apply_seek(cap, -float(args.skip_seconds))
-                        continue
-
-                    elif action == 'right':
-                        if paused:
-                            # next frame
-                            apply_step_frame(cap, +1)
-                            ret, frame = cap.read()
-                            if ret:
-                                last_frame = frame
-                        else:
-                            apply_seek(cap, +float(args.skip_seconds))
-                        continue
-
-                    elif action == 'prev_frame':
-                        apply_step_frame(cap, -1)
-                        ret, frame = cap.read()
-                        if ret:
-                            last_frame = frame
-                        paused = True
-                        continue
-
-                    elif action == 'next_frame':
-                        apply_step_frame(cap, +1)
-                        ret, frame = cap.read()
-                        if ret:
-                            last_frame = frame
-                        paused = True
                         continue
 
                 else:
@@ -2398,6 +2358,10 @@ def main():
         if args.yield_report and len(complete_area_hist) >= 2:
             try:
                 stats = calculate_yield_statistics(complete_area_hist, args.yield_bin_seconds)
+                stats['calibration'] = calibration.metadata()
+                stats['estimated_half_mass_share'] = (
+                    calibration.mass_share(stats['net_average']) if stats['total_area'] > 0 else None
+                )
                 save_yield_report(stats, args.yield_output, args.source)
             except Exception as e:
                 print(f"Warning: Could not generate yield report: {e}")
