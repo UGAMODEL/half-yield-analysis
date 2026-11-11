@@ -1,6 +1,23 @@
-*.mp4
-uv.lock
-pixi.lock
-*.csv
-
+# Local environments and caches
+.venv/
 __pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Local configuration
+.env
+.env.*
+!.env.example
+.DS_Store
+
+# Input videos and generated reports
+*.mp4
+*.csv
+runs/
+
+# Environment lockfiles (not currently versioned)
+uv.lock
