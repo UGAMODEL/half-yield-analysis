@@ -1,9 +1,13 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "inference-for-pecan"
 version = "0.1.0"
 description = "Video analysis of pecan half and piece area with an operator review dashboard"
 readme = "README.md"
-requires-python = ">=3.11, <=3.13"
+requires-python = ">=3.11,<3.13"
 dependencies = [
   "ultralytics>=8.3.196",
   "torch>=2.2.2",
@@ -22,5 +26,11 @@ cuda = [
   "nvidia-ml-py>=12",
 ]
 
+[project.scripts]
+halfyield = "halfyield.cli:main"
+
 [tool.setuptools.packages.find]
-exclude = []
+include = ["halfyield*"]
+
+[tool.setuptools.package-data]
+halfyield = ["halfyield-model.pt", "assets/fonts/*", "web/*"]

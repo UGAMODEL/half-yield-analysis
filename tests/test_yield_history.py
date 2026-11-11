@@ -2,7 +2,7 @@
 import unittest
 from unittest.mock import patch
 
-from yield_history import YieldHistory, integrated_ratio_last
+from halfyield.yield_history import YieldHistory, integrated_ratio_last
 
 
 class YieldHistoryTests(unittest.TestCase):
@@ -27,7 +27,7 @@ class YieldHistoryTests(unittest.TestCase):
 
     def test_ratio_is_calculated_once_per_accepted_point(self):
         history = YieldHistory(2000)
-        with patch('yield_history.integrated_ratio_last', wraps=integrated_ratio_last) as calculate:
+        with patch('halfyield.yield_history.integrated_ratio_last', wraps=integrated_ratio_last) as calculate:
             history.append(0, 3, 1)
             history.append(1000, 3, 1)
             history.append(1000, 1, 3)

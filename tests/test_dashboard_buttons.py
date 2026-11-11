@@ -5,8 +5,8 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
-from main import parse_key
-from operator_dashboard import OperatorDashboard
+from halfyield.main import parse_key
+from halfyield.operator_dashboard import OperatorDashboard
 
 
 class DashboardButtonTests(unittest.TestCase):

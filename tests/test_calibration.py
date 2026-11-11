@@ -6,8 +6,8 @@ import unittest
 
 import cv2
 
-from calibration import Calibration, CalibrationControls
-from main import calculate_yield_statistics, save_yield_report
+from halfyield.calibration import Calibration, CalibrationControls
+from halfyield.main import calculate_yield_statistics, save_yield_report
 
 
 class CalibrationTests(unittest.TestCase):

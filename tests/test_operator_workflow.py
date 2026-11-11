@@ -8,8 +8,8 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
-import main
-from operator_dashboard import OperatorDashboard
+from halfyield import main
+from halfyield.operator_dashboard import OperatorDashboard
 
 
 class VideoCapture:
@@ -48,23 +48,37 @@ class OperatorWorkflowTests(unittest.TestCase):
         self.inference_settings = []
         read_action = OperatorDashboard.read_action
         action_count = 0
-        callback = None
         events = iter(keys)
         self.playback_states = []
-        original_render = OperatorDashboard.render
-        def render(dashboard, frame, ratio, series, position, duration, paused, slow, complete=False):
-            self.playback_states.append(paused)
-            return original_render(dashboard, frame, ratio, series, position, duration, paused, slow, complete)
-        def set_mouse_callback(window, handler):
-            nonlocal callback
-            callback = handler
-        def wait_key(delay):
-            event = next(events)
-            if isinstance(event, tuple):
-                kind, x, y = event
-                callback(kind, x, y, 0, None)
-                return -1
-            return event
+        dashboard_ref = []
+        original_init = OperatorDashboard.__init__
+        def init_dashboard(dashboard, *args):
+            original_init(dashboard, *args)
+            dashboard.render(np.zeros((32, 32, 3), np.uint8), .75, [], 0, 5, False, False)
+            dashboard_ref.append(dashboard)
+        owner = self
+        class Window:
+            closed = False
+            def open(self):
+                pass
+            def update(self, state):
+                owner.playback_states.append(state['paused'])
+            def show(self, frame, delay):
+                event = next(events)
+                if event == 'close':
+                    self.closed = True
+                    return None
+                if isinstance(event, tuple):
+                    kind, x, y = event
+                    dashboard_ref[0]._on_mouse(kind, x, y, 0, None)
+                    return -1
+                return event
+            def take_calibration(self):
+                return None
+            def close(self):
+                self.closed = True
+            def wait(self):
+                pass
         def calibrate(dashboard, key):
             nonlocal action_count
             action_count += 1
@@ -86,12 +100,9 @@ class OperatorWorkflowTests(unittest.TestCase):
                                 create_video_capture=lambda *a, **k: capture,
                                 process_frame=process,
                                 save_yield_report=save), \
-                 patch.multiple(cv2, namedWindow=lambda *a: None, resizeWindow=lambda *a: None,
-                                setMouseCallback=set_mouse_callback, imshow=lambda *a: None,
-                                waitKey=wait_key,
-                                getWindowProperty=lambda *a: 1, destroyAllWindows=lambda: None), \
+                 patch.object(main, 'ReviewWindow', Window), \
+                 patch.object(OperatorDashboard, '__init__', init_dashboard), \
                  patch.object(OperatorDashboard, 'read_action', calibrate), \
-                 patch.object(OperatorDashboard, 'render', render), \
                  patch('sys.argv', ['main.py', '--source', str(source), '--show', *extra]):
                 main.main()
         return samples
@@ -130,6 +141,11 @@ class OperatorWorkflowTests(unittest.TestCase):
         reports = self.run_review([-1, -1, ord(','), ord(' '), -1, -1, ord('q')])
         self.assertEqual(len(reports), 1)
         self.assertGreater(reports[0]['duration_sec'], 0)
+        self.assertAlmostEqual(reports[0]['net_average'], .75)
+
+    def test_window_close_saves_report_without_a_quit_key(self):
+        reports = self.run_review([-1, -1, 'close'])
+        self.assertEqual(len(reports), 1)
         self.assertAlmostEqual(reports[0]['net_average'], .75)
 
     def test_frame_step_accounts_for_next_unread_position(self):

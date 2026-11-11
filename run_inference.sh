@@ -14,4 +14,4 @@ VIDEO_PATH="$1"
 shift  # Remove first argument (video path)
 
 # Run with all arguments
-uv run python main.py --source "$VIDEO_PATH" --model halfyield-model.pt "$@"
+uv run python main.py --source "$VIDEO_PATH" "$@"

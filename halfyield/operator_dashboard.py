@@ -1,12 +1,12 @@
-"""OpenCV operator display; measurement and saved video stay independent of the UI."""
+"""Operator dashboard rendering; measurement and saved video stay independent of the UI."""
 from pathlib import Path
 from collections import deque
 
 import cv2
 import numpy as np
 
-from calibration import Calibration, CalibrationControls
-from hmi_style import HMIText, UGAStyle
+from .calibration import Calibration, CalibrationControls
+from .hmi_style import HMIText, UGAStyle
 
 
 class OperatorDashboard:
@@ -32,9 +32,6 @@ class OperatorDashboard:
         self.actions = deque()
         self.pressed_action = None
         self.notice = 'CSV report is saved when you finish. Measurements use detected area, not weight.'
-        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(window_name, self.WIDTH, self.HEIGHT)
-        cv2.setMouseCallback(window_name, self._on_mouse)
 
     def render(self, frame, ratio, series, position, duration, paused, slow, complete=False):
         height = 1090 if self.calibration_controls.open else self.HEIGHT
@@ -66,8 +63,6 @@ class OperatorDashboard:
         action = self.actions.popleft() if self.actions else key_action
         if action == 'calibration':
             self.calibration_controls.open = not self.calibration_controls.open
-            height = 1090 if self.calibration_controls.open else self.HEIGHT
-            cv2.resizeWindow(self.window_name, self.WIDTH, height)
             return None
         return action
 

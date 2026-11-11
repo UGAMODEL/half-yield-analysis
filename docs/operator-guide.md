@@ -1,13 +1,13 @@
 # Operator guide
 
-Run commands from the repository root after you install the dependencies.
+Install the app with the instructions in the [README](../README.md#install-and-start).
 
 ## Operator workflow
 
-Start the file-picker launcher:
+Start the browser interface:
 
 ```bash
-uv run python desktop.py
+halfyield
 ```
 
 1. Select a recorded processing video.
@@ -15,18 +15,16 @@ uv run python desktop.py
 3. Select a rolling measurement window.
 4. Select **Start review**.
 5. Use **Pause**, **Back**, **Ahead**, or the frame controls to inspect the video.
-6. Select **Finish / save CSV** to close the review and save the report.
+6. Select **Finish / save CSV** to finish the review and save the report.
 
-The launcher requires Python with Tk support. For Homebrew Python 3.11, install `python-tk@3.11`.
-If Tk is unavailable, start the same dashboard from the command line:
-
-```bash
-uv run python main.py --source latest.mp4 --show
-```
+The interface opens in your default browser. Tk is not required.
+Close the tab or window to finish the review and save its current report segment.
+If a close event is lost, the runner stops after 20 seconds without a browser heartbeat.
+Reloading ends the session. Run `halfyield` again for another review.
 
 The dashboard shows half share, piece share, a trend, and video position.
 The video remains visible at the end until you finish or seek to another position.
-The dashboard always shows the trend. The legacy chart overlay flags apply to neither its size nor its position.
+The dashboard shows the trend by default. Use **View settings** to change visibility and spacing. The legacy chart overlay flags apply to neither its size nor its position.
 Saved annotated videos do not include dashboard controls.
 
 **Measurement:** Half share equals detected half area divided by detected half and piece area.
@@ -37,7 +35,7 @@ Check camera alignment before each review. The measurement region is fixed at th
 **Report scope:** Each seek or frame step clears the measurement history and starts a new report segment.
 Resume playback after inspection to collect samples. The report requires at least two playback samples.
 The CSV includes only the segment after the most recent seek or step.
-The launcher suggests a timestamped report name and asks before it replaces an existing report.
+The browser generates a timestamped report name and rejects existing report paths.
 Command-line report naming retains its existing behavior.
 
 
@@ -50,15 +48,13 @@ White text appears on red backgrounds. Red text appears on white backgrounds.
 The interface does not pair red text with black backgrounds or black text with red backgrounds.
 
 The dashboard bundles Oswald at Medium weight for headings and readings, and Merriweather Sans for control labels and supporting text.
-Font licenses are in `assets/fonts`. Text masks are cached to limit rendering work during playback.
-The optional Tk launcher uses installed Merriweather Sans, with the approved Georgia font as its fallback.
-The launcher uses Georgia for its title.
+Font licenses are in `halfyield/assets/fonts`. The browser loads the bundled fonts locally.
 
 
 ### Calibration
 
 Select **Calibration** in the review window to show six sliders.
-Drag a slider and release it to apply the value. Each change starts a new report segment.
+Adjust the sliders, then select **Apply calibration**. Each application starts a new report segment.
 Pause playback to compare detections on the same frame. Resume playback to collect new report samples.
 
 - **Half, piece, obscured, and shell confidence:** Minimum accepted detection confidence for each class, from 0% to 100%.
@@ -78,7 +74,6 @@ The CSV records all confidence thresholds, both coefficients, and estimated mass
 Calibration values apply to the current review. Use command-line options to reuse precise values in another review:
 
 ```bash
-uv run python main.py --source latest.mp4 --show --half-conf 0.35 --piece-conf 0.30 \
+halfyield --source latest.mp4 --show --half-conf 0.35 --piece-conf 0.30 \
   --half-mass-per-area 0.0012 --piece-mass-per-area 0.0008
 ```
-

@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>HalfYield · Processing review</title><link rel="stylesheet" href="style.css"><script src="app.js" defer></script>
+  </head>
+  <body>
+    <header>
+      <div>
+        <span class="eyebrow">HALFYIELD / QUALITY CONTROL</span><h1>Processing review</h1>
+      </div>
+      <span id="status" role="status">Choose a video</span>
+    </header>
+    <main>
+      <section id="setup">
+        <h2>Review your processing line</h2><p>Choose a recorded video. Inference runs on this computer.</p>
+        <form id="start-form">
+          <label>
+            Video file<input id="video" type="file" accept="video/*">
+          </label>
+          <p class="muted">Or enter its local path to avoid copying a large video.</p>
+          <label>
+            Local video path<input id="source" placeholder="/path/to/video.mp4">
+          </label>
+          <div class="fields">
+            <label>
+              CSV report path (optional)<input id="report" placeholder="A new timestamped report in the working folder">
+            </label>
+            <label>
+              Rolling window (seconds)<input id="window" type="number" min="1" max="86400" value="60" required>
+            </label>
+          </div>
+          <button class="primary" id="start">Start review</button>
+        </form>
+      </section>
+      <section id="review" hidden>
+        <div class="review-grid">
+          <div class="inspection">
+            <img id="frame" alt="Annotated video with detected pecan regions">
+            <div class="caption">
+              <span>INSPECTION VIEW</span><span id="filename"></span>
+            </div>
+          </div>
+          <aside>
+            <span class="eyebrow">HALF SHARE / AREA</span>
+            <div id="half" class="reading">
+              —
+            </div>
+            <p id="window-label"></p>
+            <div class="metric">
+              <span>Piece share</span><strong id="piece">—</strong>
+            </div>
+            <div class="metric">
+              <span>Est. half mass share</span><strong id="mass">—</strong>
+            </div>
+            <h2 class="chart-title">Half share trend</h2>
+            <svg id="chart" viewBox="0 0 400 160" role="img" aria-label="Rolling half area share over video time">
+              <path class="grid" d="M0 10H350 M0 75H350 M0 140H350"/><text x="358" y="15">100%</text><text x="358" y="80">50%</text><text x="358" y="145">0%</text><path id="trend"/>
+            </svg>
+            <p class="muted">Half area / (half + piece area).<br>Shell and obscured material excluded.</p>
+          </aside>
+        </div>
+        <div class="transport">
+          <progress id="progress" value="0" max="1" aria-label="Video position"></progress>
+          <div class="position">
+            <span id="time">00:00 / 00:00</span><span>Seeking starts a new report segment.</span>
+          </div>
+          <div class="buttons">
+            <button data-action="toggle_pause" id="pause">Pause</button><button data-action="seek_back">Back 5s</button><button data-action="seek_forward">Ahead 5s</button><button data-action="prev_frame">Previous frame</button><button data-action="next_frame">Next frame</button><button data-action="toggle_slow" id="slow">Slow: off</button><button data-action="quit" class="primary">Finish / save CSV</button>
+          </div>
+        </div>
+        <details id="calibration">
+          <summary>Calibration</summary><p>Changes start a new report segment. Mass defaults are placeholders. Use weighed samples to calibrate each material separately.</p>
+          <form id="calibration-form">
+            <div id="sliders" class="sliders">
+            </div>
+            <button type="submit">Apply calibration</button>
+          </form>
+        </details>
+        <p id="notice" role="status"></p>
+      </section>
+      <p id="message" role="alert"></p>
+      <footer>
+        Area-based estimate, not weight yield. Check camera alignment before each review.
+      </footer>
+    </main>
+    <details class="tweaks">
+      <summary>View settings</summary>
+      <label>
+        Control spacing<select id="spacing"><option value="relaxed">Relaxed</option><option value="compact">Compact</option></select>
+      </label>
+      <label>
+        Trend display<select id="chart-view"><option value="show">Visible</option><option value="hide">Hidden</option></select>
+      </label>
+    </details>
+  </body>
+</html>
